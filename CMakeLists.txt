@@ -22,7 +22,8 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
-tvm_option(USE_COV "Build with coverage" ON)
+tvm_option(USE_COV "Build with coverage" OFF)
+tvm_option(USE_LIBFUZZ "Build with coverage" ON)
 tvm_option(USE_CUDA "Build with CUDA" OFF)
 tvm_option(USE_OPENCL "Build with OpenCL" OFF)
 tvm_option(USE_VULKAN "Build with Vulkan" OFF)
@@ -472,9 +473,9 @@ include(cmake/modules/Logging.cmake)
 
 include(cmake/modules/contrib/PAPI.cmake)
 
-if(USE_COV)
-  target_compile_options(tvm_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
-  target_compile_options(tvm_runtime_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
+if(USE_LIBFUZZ)
+   target_link_libraries(tvm_objs PRIVATE -fsanitize=fuzzer)
+   target_link_libraries(tvm_runtime_objs PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(USE_MICRO)
@@ -693,3 +694,16 @@ if(USE_CCACHE) # True for AUTO, ON, /path/to/ccache
   # Set the flag for ccache
   set(CXX_COMPILER_LAUNCHER PATH_TO_CCACHE)
 endif(USE_CCACHE)
+
+if(USE_LIBFUZZ)
+set(CMAKE_CXX_STANDARD 17)
+add_executable(fuzz_me ${CMAKE_SOURCE_DIR}/fuzz_me.cc)
+target_compile_options(fuzz_me
+            PRIVATE -fsanitize=fuzzer
+            )
+
+target_link_libraries(fuzz_me
+            PRIVATE -fsanitize=fuzzer ${TVM_TEST_LIBRARY_NAME} pthread
+            )
+# target_link_libraries(fuzz_me PRIVATE ${TVM_TEST_LIBRARY_NAME} pthread)
+endif(USE_LIBFUZZ)
