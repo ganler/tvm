@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.2)
 project(tvm C CXX)
 
+set(CMAKE_THREAD_LIBS_INIT "-lpthread")
+set(CMAKE_HAVE_THREADS_LIBRARY 1)
+set(CMAKE_USE_WIN32_THREADS_INIT 0)
+set(CMAKE_USE_PTHREADS_INIT 1)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer-no-link")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=fuzzer-no-link")
+
+link_libraries(/usr/lib/clang/12.0.1/lib/linux/libclang_rt.fuzzer_no_main-x86_64.a)
+
 # Utility functions
 include(cmake/utils/Utils.cmake)
 include(cmake/utils/FindCUDA.cmake)
@@ -72,7 +83,7 @@ tvm_option(USE_CUBLAS "Build with cuBLAS" OFF)
 tvm_option(USE_THRUST "Build with Thrust" OFF)
 tvm_option(USE_MIOPEN "Build with ROCM:MIOpen" OFF)
 tvm_option(USE_ROCBLAS "Build with ROCM:RoCBLAS" OFF)
-tvm_option(USE_SORT "Build with sort support" ON)
+tvm_option(USE_SORT "Build with sort support" OFF)
 tvm_option(USE_NNPACK "Build with nnpack support" OFF)
 tvm_option(USE_RANDOM "Build with random support" ON)
 tvm_option(USE_MICRO_STANDALONE_RUNTIME "Build with micro.standalone_runtime support" OFF)
@@ -473,10 +484,10 @@ include(cmake/modules/Logging.cmake)
 
 include(cmake/modules/contrib/PAPI.cmake)
 
-if(USE_LIBFUZZ)
-   target_link_libraries(tvm_objs PRIVATE -fsanitize=fuzzer)
-   target_link_libraries(tvm_runtime_objs PRIVATE -fsanitize=fuzzer)
-endif()
+# if(USE_LIBFUZZ)
+  #  target_compile_options(tvm_objs PRIVATE -fsanitize=fuzzer-no-link)
+  #  target_compile_options(tvm_runtime_objs PRIVATE -fsanitize=fuzzer-no-link)
+# endif()
 
 if(USE_MICRO)
   # NOTE: cmake doesn't track dependencies at the file level across subdirectories. For the
@@ -696,14 +707,9 @@ if(USE_CCACHE) # True for AUTO, ON, /path/to/ccache
 endif(USE_CCACHE)
 
 if(USE_LIBFUZZ)
-set(CMAKE_CXX_STANDARD 17)
-add_executable(fuzz_me ${CMAKE_SOURCE_DIR}/fuzz_me.cc)
-target_compile_options(fuzz_me
-            PRIVATE -fsanitize=fuzzer
-            )
+  add_executable(fuzz_me ${CMAKE_SOURCE_DIR}/fuzz_me.cc)
 
-target_link_libraries(fuzz_me
-            PRIVATE -fsanitize=fuzzer ${TVM_TEST_LIBRARY_NAME} pthread
-            )
-# target_link_libraries(fuzz_me PRIVATE ${TVM_TEST_LIBRARY_NAME} pthread)
+  target_compile_options(fuzz_me PUBLIC -fsanitize=fuzzer)
+  target_link_libraries(fuzz_me PUBLIC /usr/lib/clang/12.0.1/lib/linux/libclang_rt.fuzzer-x86_64.a)
+  target_link_libraries(fuzz_me PUBLIC tvm tvm_runtime pthread)
 endif(USE_LIBFUZZ)
