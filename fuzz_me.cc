@@ -46,8 +46,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
 
     tvm::IRModule ir_mod(tvm::Downcast<tvm::IRModule>(tvm::LoadJSON(data)));
     auto module = tvm::build(ir_mod, tvm::Target("llvm"), tvm::Target("llvm"));
-  } catch (...) {
-    std::cout << "----- [LOG][Tzer.Baseline.LibFuzzer] Some error occurred... " << std::endl;
-  }
+  } catch (...) {}
   return 0;  // Non-zero return values are reserved for future use.
 }
