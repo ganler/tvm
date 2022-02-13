@@ -1892,6 +1892,7 @@ class OperatorConverter(object):
         fully_connected_options = FullyConnectedOptions()
         fully_connected_options.Init(op_options.Bytes, op_options.Pos)
         fused_activation_fn = fully_connected_options.FusedActivationFunction()
+        keep_num_dims = fully_connected_options.KeepNumDims()
 
         # weight tensor type should be INT8/UINT8 (quantization) or FLOAT32
         weight_tensor_type = weight_tensor.tensor.Type()
@@ -1968,6 +1969,13 @@ class OperatorConverter(object):
 
         else:
             out = self.convert_fused_activation_function(out, fused_activation_fn)
+
+        # Change the output shape calculation based on keep_dim option
+        if keep_num_dims:
+            input_shape = _infer_shape(self.get_tensor_expr(input_tensor))
+            output_shape = input_shape
+            output_shape[-1] = weight_tensor_shape[0]
+            out = _op.reshape(out, output_shape)
 
         return out
 

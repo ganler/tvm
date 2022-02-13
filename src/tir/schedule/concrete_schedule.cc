@@ -30,7 +30,7 @@ Schedule Schedule::Concrete(IRModule mod, support::LinearCongruentialEngine::TRa
   n->error_render_level_ = error_render_level;
   n->symbol_table_ = {};
   n->analyzer_ = std::make_unique<arith::Analyzer>();
-  support::LinearCongruentialEngine(&n->rand_state_).Seed(seed);
+  n->Seed(seed);
   return Schedule(std::move(n));
 }
 
@@ -242,6 +242,15 @@ Array<ExprRV> ConcreteScheduleNode::SamplePerfectTile(const LoopRV& loop_rv, int
   throw;
 }
 
+LoopRV ConcreteScheduleNode::SampleComputeLocation(const BlockRV& block_rv,
+                                                   Optional<Integer> decision) {
+  TVM_TIR_SCHEDULE_BEGIN();
+  return CreateRV<LoopRV>(
+      tir::SampleComputeLocation(state_, &this->rand_state_, this->GetSRef(block_rv), &decision));
+  TVM_TIR_SCHEDULE_END("sample-compute-location", this->error_render_level_);
+  throw;
+}
+
 /******** Schedule: Get blocks & loops ********/
 
 BlockRV ConcreteScheduleNode::GetBlock(const String& name, const String& func_name) {
@@ -376,6 +385,31 @@ Array<LoopRV> ConcreteScheduleNode::Split(const LoopRV& loop_rv,
     IRModule mod_;
     For loop_;
   };
+
+  class NonPositiveFactorError : public ScheduleError {
+   public:
+    explicit NonPositiveFactorError(IRModule mod, int64_t factor, size_t idx)
+        : mod_(std::move(mod)), factor_(factor), idx_(idx) {}
+
+    String FastErrorString() const final {
+      return "ScheduleError: All the constant factors are required to be positive. However, some "
+             "constant input factor is zero or negative.";
+    }
+    String DetailRenderTemplate() const final {
+      std::ostringstream os;
+      os << "All the constant factors are required to be positive. However, the factor at position "
+         << idx_ << " is " << factor_;
+      return os.str();
+    }
+    IRModule mod() const final { return mod_; }
+    Array<ObjectRef> LocationsOfInterest() const final { return {}; }
+
+   private:
+    IRModule mod_;
+    int64_t factor_;
+    size_t idx_;
+  };
+
   // Prepare for the splitting
   StmtSRef loop_sref = this->GetSRef(loop_rv);
   const ForNode* loop = TVM_SREF_TO_FOR(loop, loop_sref);
@@ -389,13 +423,15 @@ Array<LoopRV> ConcreteScheduleNode::Split(const LoopRV& loop_rv,
   for (size_t i = 0; i < factor_rvs.size(); i++) {
     if (!factor_rvs[i].defined()) {
       factors.push_back(Integer(-1));
-      if (infer_index == -1) {
-        infer_index = i;
-      } else {
+      if (infer_index != -1) {
         throw NotSingleInferFactorError(state_->mod);
       }
+      infer_index = i;
     } else {
       PrimExpr factor = this->Get(factor_rvs[i].value());
+      if (is_const_int(factor) && !is_positive_const(factor)) {
+        throw NonPositiveFactorError(state_->mod, factor.as<IntImmNode>()->value, i);
+      }
       factors.push_back(factor);
       tot_length *= factor;
     }
@@ -570,6 +606,29 @@ BlockRV ConcreteScheduleNode::RFactor(const LoopRV& loop_rv, int factor_axis) {
 }
 
 /******** Schedule: Blockize & Tensorize ********/
+BlockRV ConcreteScheduleNode::Blockize(const LoopRV& loop_rv) {
+  StmtSRef result{nullptr};
+  TVM_TIR_SCHEDULE_BEGIN();
+  result = tir::Blockize(state_, this->GetSRef(loop_rv));
+  this->state_->DebugVerify();
+  TVM_TIR_SCHEDULE_END("blockize", this->error_render_level_);
+  return CreateRV<BlockRV>(result);
+}
+
+void ConcreteScheduleNode::Tensorize(const LoopRV& loop_rv, const String& intrin) {
+  TVM_TIR_SCHEDULE_BEGIN();
+  tir::Tensorize(state_, this->GetSRef(loop_rv), tir::TensorIntrin::Get(intrin));
+  this->state_->DebugVerify();
+  TVM_TIR_SCHEDULE_END("tensorize", this->error_render_level_);
+}
+
+void ConcreteScheduleNode::Tensorize(const BlockRV& block_rv, const String& intrin) {
+  TVM_TIR_SCHEDULE_BEGIN();
+  tir::Tensorize(state_, this->GetSRef(block_rv), tir::TensorIntrin::Get(intrin));
+  this->state_->DebugVerify();
+  TVM_TIR_SCHEDULE_END("tensorize", this->error_render_level_);
+}
+
 /******** Schedule: Annotation ********/
 
 ObjectRef ConcreteScheduleNode::CheckAndGetAnnotationValue(const ObjectRef& ann_val) {
@@ -580,6 +639,14 @@ ObjectRef ConcreteScheduleNode::CheckAndGetAnnotationValue(const ObjectRef& ann_
     ICHECK(!ann_val->IsInstance<StringImmNode>())
         << "TypeError: runtime::String is expected, but gets StringImm";
     return this->Get(GetRef<PrimExpr>(expr));
+  }
+  if (const auto* arr = ann_val.as<ArrayNode>()) {
+    Array<ObjectRef> result;
+    result.reserve(arr->size());
+    for (size_t i = 0; i < arr->size(); i++) {
+      result.push_back(CheckAndGetAnnotationValue(arr->at(i)));
+    }
+    return std::move(result);
   }
   LOG(FATAL)
       << "TypeError: Only strings, integers, floats, ExprRVs and Arrays are supported for now, but "
@@ -611,9 +678,9 @@ void ConcreteScheduleNode::Annotate(const BlockRV& block_rv, const String& ann_k
   TVM_TIR_SCHEDULE_END("annotate", this->error_render_level_);
 }
 
-void ConcreteScheduleNode::Unannotate(const BlockRV& loop_rv, const String& ann_key) {
+void ConcreteScheduleNode::Unannotate(const BlockRV& block_rv, const String& ann_key) {
   TVM_TIR_SCHEDULE_BEGIN();
-  tir::Unannotate(state_, this->GetSRef(loop_rv), ann_key);
+  tir::Unannotate(state_, this->GetSRef(block_rv), ann_key);
   this->state_->DebugVerify();
   TVM_TIR_SCHEDULE_END("unannotate", this->error_render_level_);
 }

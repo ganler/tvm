@@ -511,7 +511,7 @@ Range IntSet::CoverRange(Range max_range) const {
   const IntervalSetNode* s_int = (*this).as<IntervalSetNode>();
   ICHECK(s_int != nullptr);
   if (s_int->HasUpperBound() && s_int->HasLowerBound()) {
-    return Range::FromMinExtent(s_int->min_value,
+    return Range::FromMinExtent(analyzer.Simplify(s_int->min_value),
                                 analyzer.Simplify(s_int->max_value + 1 - s_int->min_value));
   }
   return max_range;
@@ -570,6 +570,20 @@ bool IntSet::CanProveNonNegative() const {
   if (const IntervalSetNode* s_int = (*this).as<IntervalSetNode>()) {
     auto min = analyzer.Simplify(s_int->min_value);
     return is_zero(min) || is_positive_const(min);
+  }
+  return false;
+}
+
+bool IntSet::HasLowerBound() const {
+  if (const IntervalSetNode* s_int = (*this).as<IntervalSetNode>()) {
+    return s_int->HasLowerBound();
+  }
+  return false;
+}
+
+bool IntSet::HasUpperBound() const {
+  if (const IntervalSetNode* s_int = (*this).as<IntervalSetNode>()) {
+    return s_int->HasUpperBound();
   }
   return false;
 }
@@ -835,9 +849,10 @@ Optional<Array<IntSet>> EstimateRegionLowerBound(const Array<Range>& region,
     for (const Range& range : region) {
       affine_indices.push_back(range->min);
     }
+    DiagnosticContext diag_ctx(DiagnosticContext::Default(IRModule()));
     iter_sum_exprs = DetectIterMap(
         /*indices=*/affine_indices, /*input_iters=*/var_dom,
-        /*predicate=*/predicate, /*require_bijective=*/false, analyzer);
+        /*predicate=*/predicate, /*require_bijective=*/false, analyzer, diag_ctx);
   }
   if (iter_sum_exprs.empty()) {
     return NullOpt;
@@ -857,6 +872,7 @@ Optional<Array<IntSet>> EstimateRegionLowerBound(const Array<Range>& region,
     if (!analyzer->CanProve(range->extent >= split->scale)) {
       return NullOpt;
     }
+
     const PrimExpr& base = sum_expr->base;
     // IterSplitExpr: (source // lower_factor) % extent * scale
     // where `(source // lower_factor) % extent` is within [0, extent - 1]
