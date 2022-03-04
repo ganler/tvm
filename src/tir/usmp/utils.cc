@@ -22,6 +22,7 @@
  * \brief Utilities for Unified Static Memory Planner
  */
 
+#include <tvm/ir/memory_pools.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/tir/analysis.h>
@@ -92,50 +93,6 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
                 << ",\n  memory_pressure=" << node->memory_pressure << ")";
     });
 
-PoolInfo::PoolInfo(String pool_name, Map<Target, String> target_access, Integer size_hint_bytes,
-                   Integer clock_frequency_hz, Integer read_bandwidth_bytes_per_cycle,
-                   Integer write_bandwidth_bytes_per_cycle, Integer read_latency_cycles,
-                   Integer write_latency_cycles, Map<Target, Integer> target_burst_bytes,
-                   Bool is_internal) {
-  auto poolinfo_node = make_object<PoolInfoNode>();
-  poolinfo_node->pool_name = pool_name;
-  poolinfo_node->size_hint_bytes = size_hint_bytes;
-  poolinfo_node->target_access = target_access;
-  poolinfo_node->clock_frequency_hz = clock_frequency_hz;
-  poolinfo_node->read_bandwidth_bytes_per_cycle = read_bandwidth_bytes_per_cycle;
-  poolinfo_node->write_bandwidth_bytes_per_cycle = write_bandwidth_bytes_per_cycle;
-  poolinfo_node->read_latency_cycles = read_latency_cycles;
-  poolinfo_node->write_latency_cycles = write_latency_cycles;
-  poolinfo_node->target_burst_bytes = target_burst_bytes;
-  poolinfo_node->is_internal = is_internal;
-  data_ = std::move(poolinfo_node);
-}
-
-TVM_REGISTER_NODE_TYPE(PoolInfoNode);
-TVM_REGISTER_GLOBAL("tir.usmp.PoolInfo")
-    .set_body_typed([](String pool_name, Map<Target, String> target_access, Integer size_hint_bytes,
-                       Integer clock_frequency_hz, Integer read_bandwidth_bytes_per_cycle,
-                       Integer write_bandwidth_bytes_per_cycle, Integer read_latency_cycles,
-                       Integer write_latency_cycles, Map<Target, Integer> target_burst_bytes) {
-      return PoolInfo(pool_name, target_access, size_hint_bytes, clock_frequency_hz,
-                      read_bandwidth_bytes_per_cycle, write_bandwidth_bytes_per_cycle,
-                      read_latency_cycles, write_latency_cycles, target_burst_bytes, Bool(false));
-    });
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<PoolInfoNode>([](const ObjectRef& ref, ReprPrinter* p) {
-      auto* node = static_cast<const PoolInfoNode*>(ref.get());
-      p->stream << "PoolInfoNode(\n"
-                << "  pool_name=" << node->pool_name << ",\n  target_access=" << node->target_access
-                << ",\n  size_hint_bytes=" << node->size_hint_bytes
-                << ",\n  clock_frequency_hz=" << node->clock_frequency_hz
-                << ",\n  read_bandwidth_bytes_per_cycle=" << node->read_bandwidth_bytes_per_cycle
-                << ",\n  write_bandwidth_bytes_per_cycle=" << node->write_bandwidth_bytes_per_cycle
-                << ",\n  read_latency_cycles=" << node->read_latency_cycles
-                << ",\n  write_latency_cycles=" << node->write_latency_cycles
-                << ",\n  target_burst_bytes=" << node->target_burst_bytes << ")";
-    });
-
 PoolAllocation::PoolAllocation(PoolInfo pool_info, Integer byte_offset) {
   auto pool_allocation_node = make_object<PoolAllocationNode>();
   pool_allocation_node->pool_info = pool_info;
@@ -157,12 +114,13 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
                 << ")";
     });
 
-AllocatedPoolInfo::AllocatedPoolInfo(PoolInfo pool_info, Integer allocated_size, Var pool_var) {
+AllocatedPoolInfo::AllocatedPoolInfo(PoolInfo pool_info, Integer allocated_size,
+                                     Integer pool_var_idx) {
   auto allocated_poolinfo_node = make_object<AllocatedPoolInfoNode>();
   allocated_poolinfo_node->pool_info = pool_info;
   allocated_poolinfo_node->allocated_size = allocated_size;
-  if (pool_var.defined()) {
-    allocated_poolinfo_node->pool_var = pool_var;
+  if (pool_var_idx.defined()) {
+    allocated_poolinfo_node->pool_var_idx = pool_var_idx;
   }
   data_ = std::move(allocated_poolinfo_node);
 }
@@ -223,7 +181,7 @@ class ModuleWorkspaceSizeCalculator : public StmtExprVisitor {
     for (const auto& gv_func : mod_->functions) {
       functions_.Set(gv_func.first->name_hint, Downcast<PrimFunc>(gv_func.second));
     }
-    main_func_ = Downcast<PrimFunc>(module->Lookup(::tvm::runtime::symbol::tvm_run_func_suffix));
+    main_func_ = Downcast<PrimFunc>(module->Lookup(::tvm::runtime::symbol::tvm_module_main));
     ICHECK(main_func_.defined()) << "main function is not in the module";
     Optional<Target> target_host = main_func_->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target_host) << "main function does not have a target attr";

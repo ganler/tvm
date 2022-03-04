@@ -32,6 +32,7 @@ from torch.nn import functional as F
 from tvm import relay
 from tvm.contrib import graph_executor
 from tvm.contrib.nvcc import have_fp16
+from tvm.contrib import cudnn
 import pytest
 
 sys.setrecursionlimit(10000)
@@ -1065,6 +1066,38 @@ def test_forward_conv_transpose(
         bias=bias,
     ).eval()
     verify_model(conv1d_transpose, conv1d_input_data)
+
+
+@tvm.testing.uses_gpu
+def test_forward_conv2d_transpose_group():
+    # https://github.com/apache/tvm/issues/10223
+
+    class ModulatedConvTranspose2D(torch.nn.Module):
+        def forward(self, x, w, s):
+            B, C, H, W = x.shape
+            I, O, KH, KW = w.shape
+
+            # weight is different for each input in batch (this is why we want grouped conv transpose)
+            w = w.unsqueeze(0) * s.reshape(B, 1, 1, 1, 1)
+            w = w.reshape(B * I, O, KH, KW)
+            x = x.reshape(1, B * C, H, W)
+            x = torch.nn.functional.conv_transpose2d(
+                x, w, stride=(2, 2), padding=(1, 1), output_padding=(1, 1), groups=B
+            )
+            return x.reshape(B, O, H * 2, W * 2)
+
+    b, c, h, w, k = 4, 512, 8, 16, 3
+    inputs = torch.rand(b, c, h, w)
+    weights = torch.rand(c, c // 2, k, k)
+    styles = torch.rand(b)
+
+    # cuda not supported for group > 1 conv2d_transpose
+    targets = ["llvm"]
+
+    if cudnn.exists():
+        targets.append("cuda -libs=cudnn")
+
+    verify_trace_model(ModulatedConvTranspose2D().eval(), [inputs, weights, styles], targets)
 
 
 def test_forward_deform_conv():
@@ -2280,7 +2313,7 @@ def verify_model_vm(input_model, ishapes, idtype=None, idata=None, targets=["llv
     mod, params = relay.frontend.from_pytorch(input_model, input_shapes)
 
     for tgt in targets:
-        if not tvm.runtime.enabled(tgt):
+        if not tvm.testing.device_enabled(tgt):
             continue
         print("Running on target", tgt)
 
@@ -2615,6 +2648,59 @@ def test_forward_std():
     verify_model(Std7().float().eval(), input_data=input_data)
     verify_model(Std8().float().eval(), input_data=input_data)
     verify_model(Std9().float().eval(), input_data=input_data)
+
+
+@tvm.testing.uses_gpu
+def test_forward_var_mean():
+    torch.set_grad_enabled(False)
+    input_shape = [1, 3, 10, 10]
+
+    class VarMean1(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], 1, unbiased=False)
+
+    class VarMean2(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=1, keepdim=False, unbiased=False)
+
+    class VarMean3(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=2, keepdim=True, unbiased=False)
+
+    class VarMean4(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=(2, 3), keepdim=True, unbiased=False)
+
+    class VarMean5(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=(2, 3), keepdim=False, unbiased=False)
+
+    class VarMean6(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], unbiased=False)
+
+    class VarMean7(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=1, keepdim=False, unbiased=True)
+
+    class VarMean8(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], dim=(2, 3), keepdim=True, unbiased=True)
+
+    class VarMean9(Module):
+        def forward(self, *args):
+            return torch.var_mean(args[0], unbiased=True)
+
+    input_data = torch.rand(input_shape).float()
+    verify_model(VarMean1().float().eval(), input_data=input_data)
+    verify_model(VarMean2().float().eval(), input_data=input_data)
+    verify_model(VarMean3().float().eval(), input_data=input_data)
+    verify_model(VarMean4().float().eval(), input_data=input_data)
+    verify_model(VarMean5().float().eval(), input_data=input_data)
+    verify_model(VarMean6().float().eval(), input_data=input_data)
+    verify_model(VarMean7().float().eval(), input_data=input_data)
+    verify_model(VarMean8().float().eval(), input_data=input_data)
+    verify_model(VarMean9().float().eval(), input_data=input_data)
 
 
 @tvm.testing.uses_gpu
@@ -4115,7 +4201,7 @@ def test_list_tuple():
 
     x = torch.rand([4, 4, 16, 32]).float()
     script_module = torch.jit.trace(List_tuple(), x, strict=False).eval()
-    mod, params = relay.frontend.from_pytorch(script_module, [("x", x.shape)])
+    relay.frontend.from_pytorch(script_module, [("x", x.shape)])
 
 
 if __name__ == "__main__":
