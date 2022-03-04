@@ -513,10 +513,37 @@ include(cmake/modules/Logging.cmake)
 
 include(cmake/modules/contrib/PAPI.cmake)
 
-if(USE_COV)
-  target_compile_options(tvm_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
-  target_compile_options(tvm_runtime_objs PRIVATE -fsanitize-coverage=trace-pc-guard)
-endif()
+IF(USE_COV) # CLANG-11+ please
+  MESSAGE(STATUS "Your clang version = ${CMAKE_CXX_COMPILER_VERSION}")
+  IF (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 10.0)
+    EXECUTE_PROCESS (
+        COMMAND bash -c "mv ${CMAKE_CURRENT_BINARY_DIR}/../blocklist.txt ${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    SET_SOURCE_FILES_PROPERTIES(
+      ${COMPILER_SRCS} ${RUNTIME_SRCS}
+      PROPERTIES 
+      COMPILE_FLAGS
+      "-fsanitize-coverage=trace-pc-guard -fsanitize-coverage-ignorelist=blocklist.txt")
+  ELSE()
+    MESSAGE(WARNING "Please use clang 11 or higher to enable blocklist feature!!!")
+    SET_SOURCE_FILES_PROPERTIES(
+      ${COMPILER_SRCS} ${RUNTIME_SRCS}
+      PROPERTIES 
+      COMPILE_FLAGS
+      "-fsanitize-coverage=trace-pc-guard")
+  ENDIF()
+ENDIF()
+
+# ## Workaround with ASAN
+# SET_SOURCE_FILES_PROPERTIES(
+#   ${COMPILER_SRCS} ${RUNTIME_SRCS}
+#   PROPERTIES 
+#   COMPILE_FLAGS
+#   "-fsanitize=address -fsanitize-coverage=trace-pc-guard")
+# target_link_libraries(tvm PRIVATE /usr/lib/clang/14/lib/linux/libclang_rt.asan-x86_64.so)
+# target_link_libraries(tvm_runtime PRIVATE /usr/lib/clang/14/lib/linux/libclang_rt.asan-x86_64.so)
+# # # LD_PRELOAD=$(clang-14 -print-file-name=libclang_rt.asan-x86_64.so) ASAN_OPTIONS=coverage=1 ipython
+# remember to install libclang: `sudo apt install libclang-dev`
 
 if(USE_MICRO)
   # NOTE: cmake doesn't track dependencies at the file level across subdirectories. For the
