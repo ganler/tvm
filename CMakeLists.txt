@@ -519,13 +519,13 @@ IF(USE_COV) # CLANG-11+ please
   
   IF (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 10.0)
     EXECUTE_PROCESS (
-        COMMAND bash -c "mv ${CMAKE_CURRENT_BINARY_DIR}/../blocklist.txt ${CMAKE_CURRENT_BINARY_DIR}"
+        COMMAND bash -c "cp ${CMAKE_CURRENT_BINARY_DIR}/../tvm-blocklist.txt ${CMAKE_CURRENT_BINARY_DIR}"
     )
     SET_SOURCE_FILES_PROPERTIES(
       ${COMPILER_SRCS} ${RUNTIME_SRCS}
       PROPERTIES 
       COMPILE_FLAGS
-      "-fsanitize-coverage=trace-pc-guard -fsanitize-coverage-ignorelist=blocklist.txt")
+      "-fsanitize-coverage=trace-pc-guard -fsanitize-coverage-ignorelist=tvm-blocklist.txt")
   ELSE()
     MESSAGE(WARNING "Please use clang 11 or higher to enable blocklist feature!!!")
     SET_SOURCE_FILES_PROPERTIES(
