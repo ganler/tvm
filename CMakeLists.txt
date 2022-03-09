@@ -23,7 +23,8 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
-tvm_option(USE_COV "Build with coverage" ON)
+tvm_option(USE_MEMCOV "Build with cfg-level coverage" ON)
+tvm_option(USE_ASTCOV "Build with ast-level coverage" OFF)
 tvm_option(USE_SOURCE_COV "Build with source coverage" OFF)
 tvm_option(USE_CUDA "Build with CUDA" OFF)
 tvm_option(USE_OPENCL "Build with OpenCL" OFF)
@@ -514,7 +515,7 @@ include(cmake/modules/Logging.cmake)
 
 include(cmake/modules/contrib/PAPI.cmake)
 
-IF(USE_COV) # CLANG-11+ please
+IF(USE_MEMCOV) # CLANG-11+ please
   MESSAGE(STATUS "Your clang version = ${CMAKE_CXX_COMPILER_VERSION}")
   
   IF (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 10.0)
@@ -534,11 +535,11 @@ IF(USE_COV) # CLANG-11+ please
       COMPILE_FLAGS
       "-fsanitize-coverage=trace-pc-guard")
   ENDIF()
+ENDIF()
 
-  IF(USE_SOURCE_COV)
+IF(USE_ASTCOV)
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
     SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
-  ENDIF()
 ENDIF()
 
 # ## Workaround with ASAN
