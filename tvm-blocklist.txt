@@ -1,5 +1,0 @@
-# Repeated std library is noisy.
-src:/usr/lib*
-src:/usr/include/*
-# 3rdparty library is noisy.
-src:/home/ganler/Documents/tvm/3rdparty/*

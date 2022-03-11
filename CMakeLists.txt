@@ -25,7 +25,6 @@ endif()
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
 tvm_option(USE_MEMCOV "Build with cfg-level coverage" ON)
 tvm_option(USE_ASTCOV "Build with ast-level coverage" OFF)
-tvm_option(USE_SOURCE_COV "Build with source coverage" OFF)
 tvm_option(USE_CUDA "Build with CUDA" OFF)
 tvm_option(USE_OPENCL "Build with OpenCL" OFF)
 tvm_option(USE_VULKAN "Build with Vulkan" OFF)
@@ -517,29 +516,18 @@ include(cmake/modules/contrib/PAPI.cmake)
 
 IF(USE_MEMCOV) # CLANG-11+ please
   MESSAGE(STATUS "Your clang version = ${CMAKE_CXX_COMPILER_VERSION}")
-  
-  IF (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 10.0)
-    EXECUTE_PROCESS (
-        COMMAND bash -c "cp ${CMAKE_CURRENT_BINARY_DIR}/../tvm-blocklist.txt ${CMAKE_CURRENT_BINARY_DIR}"
-    )
-    SET_SOURCE_FILES_PROPERTIES(
-      ${COMPILER_SRCS} ${RUNTIME_SRCS}
-      PROPERTIES 
-      COMPILE_FLAGS
-      "-fsanitize-coverage=trace-pc-guard -fsanitize-coverage-ignorelist=tvm-blocklist.txt")
-  ELSE()
-    MESSAGE(WARNING "Please use clang 11 or higher to enable blocklist feature!!!")
-    SET_SOURCE_FILES_PROPERTIES(
+  SET(CMAKE_CXX_FLAGS_RELEASE "-O1") # stop code inline.
+  SET_SOURCE_FILES_PROPERTIES(
       ${COMPILER_SRCS} ${RUNTIME_SRCS}
       PROPERTIES 
       COMPILE_FLAGS
       "-fsanitize-coverage=trace-pc-guard")
-  ENDIF()
 ENDIF()
 
 IF(USE_ASTCOV)
-    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
-    SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
+  SET(CMAKE_CXX_FLAGS_RELEASE "-O1") # stop code inline.
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
+  SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
 ENDIF()
 
 # ## Workaround with ASAN

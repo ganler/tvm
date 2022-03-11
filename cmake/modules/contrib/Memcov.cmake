@@ -1,4 +1,4 @@
-if(USE_COV)
+if(USE_MEMCOV)
     include(FetchContent)
     FetchContent_Declare(
       memcov
