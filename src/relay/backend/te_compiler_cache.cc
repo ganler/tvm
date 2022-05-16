@@ -21,7 +21,7 @@
 
 #include <tvm/driver/driver_api.h>
 #include <tvm/ir/type_functor.h>
-#include <tvm/meta_schedule/integration.h>
+#include <tvm/meta_schedule/apply_history_best.h>
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/attrs/device_copy.h>
 #include <tvm/relay/expr.h>
@@ -29,6 +29,7 @@
 #include <tvm/relay/op.h>
 #include <tvm/relay/op_attr_types.h>
 #include <tvm/relay/op_strategy.h>
+#include <tvm/runtime/builtin_fp16.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/te/operation.h>
@@ -167,16 +168,20 @@ class LowerToTECompute : public backend::MemoizedExprTranslator<Array<te::Tensor
           [&](const Array<tvm::tir::Var>&) {
             if (dtype == DataType::Int(16)) {
               return make_const(dtype, static_cast<const int16_t*>(data)[0]);
+            } else if (dtype == DataType::Int(8)) {
+              return make_const(dtype, static_cast<const int8_t*>(data)[0]);
+            } else if (dtype == DataType::UInt(8) || dtype == DataType::Bool()) {
+              return make_const(dtype, static_cast<const uint8_t*>(data)[0]);
             } else if (dtype == DataType::Int(32)) {
               return make_const(dtype, static_cast<const int32_t*>(data)[0]);
             } else if (dtype == DataType::Int(64)) {
               return make_const(dtype, static_cast<const int64_t*>(data)[0]);
+            } else if (dtype == DataType::Float(16)) {
+              return make_const(dtype, __gnu_h2f_ieee(static_cast<const uint16_t*>(data)[0]));
             } else if (dtype == DataType::Float(32)) {
               return make_const(dtype, static_cast<const float*>(data)[0]);
             } else if (dtype == DataType::Float(64)) {
               return make_const(dtype, static_cast<const double*>(data)[0]);
-            } else if (dtype == DataType::Bool()) {
-              return make_const(dtype, static_cast<const uint8_t*>(data)[0]);
             } else {
               LOG(FATAL) << dtype << " not handled";
               return tvm::PrimExpr();
@@ -297,11 +302,18 @@ class ScheduleBuilder : public ExprVisitor {
   explicit ScheduleBuilder(Target target) : target_(target) {
     // Whether to use auto_scheduler schedule.
     use_auto_scheduler_ = backend::IsAutoSchedulerEnabled();
+    if (backend::IsMetaScheduleEnabled()) {
+      meta_schedule_ctx_ = meta_schedule::ApplyHistoryBest::Current();
+      CHECK(meta_schedule_ctx_.defined()) << "ValueError: `use_meta_schedule` is enabled in Relay "
+                                             "build, but no ApplyHistoryBest context is provided. ";
+    } else {
+      meta_schedule_ctx_ = NullOpt;
+    }
   }
 
   CachedFunc Create(const Function& relay_func, std::function<std::string(std::string)> renamer) {
     LowerToTECompute lower_te_compute(target_);
-    Array<te::Tensor> outputs = lower_te_compute.Lower(relay_func, renamer);
+    Array<te::Tensor> tensor_outs = lower_te_compute.Lower(relay_func, renamer);
     Array<te::Tensor> fn_inputs = lower_te_compute.fn_inputs_;
     VisitExpr(relay_func->body);
 
@@ -311,12 +323,11 @@ class ScheduleBuilder : public ExprVisitor {
     prim_fn_var->checked_type_ = relay_func->checked_type();
 
     // Fusion over tupled results may leave identity relationships
-    // between inputs and outputs, and those should not be scheduled.
-    // Hence schedule only non PlaceholderOp outputs.
-    tvm::Array<te::Tensor> tensor_outs;
-    for (const auto& tensor : outputs) {
-      if (!tensor->op.as<te::PlaceholderOpNode>()) {
-        tensor_outs.push_back(tensor);
+    // between inputs and outputs, copy identity output tensors,
+    // since tir lowering do not support aliasing output to input buffer.
+    for (size_t i = 0; i < tensor_outs.size(); ++i) {
+      if (tensor_outs[i]->op.as<te::PlaceholderOpNode>()) {
+        tensor_outs.Set(i, topi::identity(tensor_outs[i]));
       }
     }
 
@@ -334,24 +345,28 @@ class ScheduleBuilder : public ExprVisitor {
           schedule = Downcast<te::Schedule>(obj);
         }
       }
-      if (backend::IsMetaScheduleEnabled()) {
-        prim_func = tir::CreatePrimFunc(Concat(fn_inputs, tensor_outs));
-        Optional<ObjectRef> opt_mod_or_base_func =
-            meta_schedule::MetaScheduleContext::QueryInsideWithScope(
-                prim_fn_var->name_hint, IRModule({{prim_fn_var, relay_func}}), target_,
-                Array<IRModule>{IRModule({{prim_fn_var, prim_func}})});
-        if (const auto* result = opt_mod_or_base_func.as<tir::PrimFuncNode>()) {
-          prim_func = GetRef<tir::PrimFunc>(result);
-        } else {
-          prim_func = tir::PrimFunc(nullptr);
+      if (meta_schedule_ctx_) {
+        IRModule relay_mod({{prim_fn_var, relay_func}});
+        IRModule tir_mod({{prim_fn_var, tir::CreatePrimFunc(Concat(fn_inputs, tensor_outs))}});
+        if (Optional<IRModule> scheduled_mod = meta_schedule_ctx_.value()->Query(
+                prim_fn_var->name_hint, relay_mod, target_, Array<IRModule>{tir_mod})) {
+          ICHECK_EQ(scheduled_mod.value()->functions.count(prim_fn_var), 1);
+          prim_func = Downcast<tir::PrimFunc>(scheduled_mod.value()->functions[prim_fn_var]);
         }
       }
 
       // Use TOPI schedule if user specificed, or the function has no auto_scheduler schedule.
       if (!schedule.defined() && !prim_func.defined()) {
-        auto anchor_impl = lower_te_compute.op_implementations_.find(anchor_op_.operator->());
-        ICHECK(anchor_impl != lower_te_compute.op_implementations_.end());
-        schedule = anchor_impl->second.Schedule(anchor_attrs_, tensor_outs, target_);
+        if (anchor_op_.defined()) {
+          auto anchor_impl = lower_te_compute.op_implementations_.find(anchor_op_.operator->());
+          ICHECK(anchor_impl != lower_te_compute.op_implementations_.end());
+          schedule = anchor_impl->second.Schedule(anchor_attrs_, tensor_outs, target_);
+        } else {
+          auto default_sched = GenericFunc::Get("schedule_injective");
+          ICHECK(default_sched.defined()) << "schedule_injective not registered for " << target_;
+          With<Target> tctx(target_);
+          schedule = default_sched(tensor_outs);
+        }
       }
       if (schedule.defined()) {
         for (const auto& scalar : lower_te_compute.scalars_) {
@@ -362,7 +377,7 @@ class ScheduleBuilder : public ExprVisitor {
       }
     }
 
-    return CachedFunc(target_, prim_fn_var, fn_inputs, outputs, schedule, prim_func, {},
+    return CachedFunc(target_, prim_fn_var, fn_inputs, tensor_outs, schedule, prim_func, {},
                       IRModule(Map<GlobalVar, BaseFunc>({})), lower_te_compute.constant_tensors_);
   }
 
@@ -377,7 +392,7 @@ class ScheduleBuilder : public ExprVisitor {
     }
 
     int op_pattern = fpattern[op];
-    if (!use_auto_scheduler_ && op_pattern >= kCommReduce) {
+    if (!use_auto_scheduler_ && !meta_schedule_ctx_.defined() && op_pattern >= kCommReduce) {
       ICHECK(!anchor_op_.defined() || anchor_op_pattern_ < kCommReduce)
           << "Cannot apply TOPI schedule to a primitive function with two complicated ops"
           << " anchor=" << anchor_op_ << " current=" << op;
@@ -395,6 +410,7 @@ class ScheduleBuilder : public ExprVisitor {
   Attrs anchor_attrs_;
   int anchor_op_pattern_{0};
   bool use_auto_scheduler_;
+  Optional<meta_schedule::ApplyHistoryBest> meta_schedule_ctx_;
 };
 
 /*!
@@ -752,6 +768,25 @@ class MakeShapeFunc : public backend::MemoizedExprTranslator<Array<te::Tensor>> 
 CachedFunc ShapeFuncFor(const Function& prim_func, const Target& target,
                         std::function<std::string(std::string)> renamer) {
   return MakeShapeFunc().Create(prim_func, target, renamer);
+}
+
+std::pair<Array<te::Tensor>, std::string> LowerTECompute(const Function& source_func, Target target,
+                                                         bool return_inputs) {
+  LowerToTECompute lower_te_compute(target);
+  Array<te::Tensor> outputs =
+      lower_te_compute.Lower(source_func, [](std::string name) { return name; });
+  // Following ScheduleBuilder, remove placeholder ops from outputs.
+  tvm::Array<te::Tensor> tensor_outs;
+  for (const auto& tensor : outputs) {
+    if (!tensor->op.as<te::PlaceholderOpNode>()) {
+      tensor_outs.push_back(tensor);
+    }
+  }
+  if (return_inputs) {
+    return std::make_pair(Concat(lower_te_compute.fn_inputs_, tensor_outs),
+                          lower_te_compute.candidate_name_);
+  }
+  return std::make_pair(tensor_outs, lower_te_compute.candidate_name_);
 }
 
 /*!

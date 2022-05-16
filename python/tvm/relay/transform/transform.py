@@ -261,7 +261,7 @@ def LazyGradientInit():
     return _ffi_api.LazyGradientInit()
 
 
-def FoldConstantExpr(expr, mod):
+def FoldConstantExpr(expr, mod, fold_qnn=False):
     """Fold the constant expressions in a Relay program.
     Parameters
     ----------
@@ -269,24 +269,37 @@ def FoldConstantExpr(expr, mod):
         The expression to fold
     mod: IRModule
         The module the expr lives in (for global calls)
+    fold_qnn: bool
+        Whether to fold constants for QNN operations.
 
     Returns
     -------
     new_expr: Expr
         The expr after Constant Folding
     """
-    return _ffi_api.FoldConstantExpr(expr, mod)
+    return _ffi_api.FoldConstantExpr(expr, mod, fold_qnn)
 
 
-def FoldConstant():
+def FoldConstant(fold_qnn=False):
     """Fold the constant expressions in a Relay program.
+
+    Because of backward compatibility reason it skips QNN primitives from folding by default.
+    There are some transformation passes like FakeQuantizationToInteger, which requires to keep QNN
+    primitives for constant subgraphs. Uncontrolled constant folding of QNN primitives may break
+    applicability of FakeQuantizationToInteger. We suggest to use FoldConstant pass with none
+    default fold_qnn=True value only when all other QNN sensitive passes were already applied.
+
+    Parameters
+    ----------
+    fold_qnn: bool
+        Whether to fold constants for QNN operations.
 
     Returns
     -------
     ret : tvm.transform.Pass
         The registered pass for constant folding.
     """
-    return _ffi_api.FoldConstant()
+    return _ffi_api.FoldConstant(fold_qnn)
 
 
 def FuseOps(fuse_opt_level=-1):
@@ -787,6 +800,24 @@ def Inline():
         The registered pass that performs inlining for a Relay IR module.
     """
     return _ffi_api.Inline()
+
+
+def InlineComposites(target):
+    """Perform inlining on the given Relay IR module. The functions originate
+    from the MergeComposite pass based on an input pattern table will fold back
+    to main. Currently, this is used for the TRT BYOC which expects a single
+    primitive function to operate on.
+
+    Parameters
+    ----------
+    target: str
+        The byoc target for which ops need to fold back to primitive function.
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass that performs inlining for a Relay IR module.
+    """
+    return _ffi_api.InlineComposites(target)
 
 
 def gradient(expr, mod=None, mode="higher_order"):
@@ -1291,6 +1322,33 @@ def FakeQuantizationToInteger(hard_fail=False, use_qat=False):
         The registered FakeQuantizationToInteger pass.
     """
     return _ffi_api.FakeQuantizationToInteger(hard_fail, use_qat)
+
+
+def FlattenAtrousConv():
+    # pylint: disable=anomalous-backslash-in-string
+    """
+    The purpose of this pass is to find a sequence of space_to_batch_nd-conv2d-batch_to_space_nd
+    operations:
+
+    .. code-block:: text
+
+      x     w
+      |     |
+      s2b   |
+       \\   /
+        conv2d
+         |
+         b2s
+
+    and convert them into subgraphs with a convolution with the modified "dilation" and
+    recalculated "padding" parameters.
+
+    Returns
+    -------
+    ret : tvm.transform.Pass
+        The registered FlattenAtrousConv pass.
+    """
+    return _ffi_api.FlattenAtrousConv()
 
 
 def ToMixedPrecision(mixed_precision_type="float16", missing_op_mode=1):

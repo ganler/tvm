@@ -35,6 +35,7 @@
 
 #include <memory>
 
+#include "../../driver/internal_driver_api.h"
 #include "../../target/func_registry_generator.h"
 #include "../../target/metadata_module.h"
 #include "../../target/source/codegen_source_base.h"
@@ -60,7 +61,9 @@ struct BuildOutput {
 };
 
 struct ExecutorCodegen {
-  void Init(runtime::Module* m, TargetMap targets) { CallFunc("init", m, targets); }
+  void Init(runtime::Module* m, const Array<Target>& raw_targets) {
+    CallFunc("init", m, raw_targets);
+  }
 
   void Codegen(IRModule mod, const Function& func, String mod_name) {
     CallFunc("codegen", mod, func, mod_name);
@@ -189,8 +192,8 @@ class RelayBuildModule : public runtime::ModuleNode {
           [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetModule(); });
     } else if (name == "build") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-        ICHECK_EQ(args.num_args, 7);
-        this->Build(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+        ICHECK_EQ(args.num_args, 6);
+        this->Build(args[0], args[1], args[2], args[3], args[4], args[5]);
       });
     } else if (name == "list_params") {
       return PackedFunc(
@@ -295,20 +298,20 @@ class RelayBuildModule : public runtime::ModuleNode {
    * \brief Build relay IRModule for graph executor
    *
    * \param mod Relay IRModule
-   * \param targets Target devices
-   * \param target_host Host target device
+   * \param raw_targets List of available targets for kernels.
    * \param executor Executor to target
    * \param runtime Runtime to codegen for
    * \param mod_name Name of the module
    */
-  void Build(IRModule mod, const TargetMap& targets, const tvm::Target& target_host,
-             const Executor& executor, const Runtime& runtime,
-             const WorkspaceMemoryPools& workspace_memory_pools, const String mod_name) {
+  void Build(IRModule mod, const Array<Target>& raw_targets, const Executor& executor,
+             const Runtime& runtime, const WorkspaceMemoryPools& workspace_memory_pools,
+             const String& mod_name) {
     VLOG_CONTEXT << "Build";
     executor_ = executor;
     runtime_ = runtime;
     workspace_memory_pools_ = workspace_memory_pools;
-    config_ = CompilationConfig(PassContext::Current(), targets, target_host);
+    config_ = CompilationConfig(PassContext::Current(), raw_targets);
+    VLOG(1) << "Using compilation config:" << std::endl << config_;
     BuildRelay(std::move(mod), mod_name);
   }
 
@@ -317,33 +320,24 @@ class RelayBuildModule : public runtime::ModuleNode {
    * \brief Optimize a Relay IRModule.
    *
    * \param relay_module The input IRModule where optmization will be applied on.
-   * \param targets The device type to `Target` mapping.
+   * \param raw_targets List of available targets for kernels.
    *
    * \return relay::IRModule The updated Relay IR module after optimization.
    */
-  IRModule Optimize(IRModule relay_module, const TargetMap& targets) {
+  IRModule Optimize(IRModule relay_module, const Array<Target>& raw_targets) {
     VLOG_CONTEXT << "Optimize";
-    // TODO(mbs): executor_ will be whatever was left over from last Build. Note that
-    // the empty executor string will CHECK fail, so how are folks using this API?
-    config_ = CompilationConfig(transform::PassContext::Current(), targets,
-                                /*optional_host_target=*/Target());
+    config_ = CompilationConfig(PassContext ::Current(), raw_targets);
+    VLOG(1) << "Using compilation config:" << std::endl << config_;
     return OptimizeImpl(std::move(relay_module));
   }
 
   IRModule OptimizeImpl(IRModule relay_module) {
     ICHECK(relay_module.defined()) << "The IRModule must be defined for the Relay compiler.";
 
-    if (!params_.empty()) {
-      ICHECK(relay_module->ContainGlobalVar("main")) << "Missing the main entry function";
-      GlobalVar main_glb_var = relay_module->GetGlobalVar("main");
-      Function main_func = Downcast<Function>(relay_module->Lookup(main_glb_var));
-      auto new_main = BindParamsByName(main_func, params_);
-      IRModuleNode* relay_module_ptr = relay_module.CopyOnWrite();
-      relay_module_ptr->Update(main_glb_var, new_main);
-    }
+    backend::BindParamsInModule(relay_module, params_);
 
-    Array<Pass> pass_seqs = GetPassPrefix(
-        /*is_homogenous=*/config_->optional_homogeneous_target.defined(), /*is_vm=*/false);
+    Array<Pass> pass_seqs =
+        GetPassPrefix(/*is_homogenous=*/config_->primitive_targets.size() == 1, /*is_vm=*/false);
     transform::PassContext pass_ctx = PassContext::Current();
 
     if (config_->optional_homogeneous_target.defined()) {
@@ -424,7 +418,7 @@ class RelayBuildModule : public runtime::ModuleNode {
 
     // Generate code for the updated function.
     executor_codegen_ = MakeExecutorCodegen(executor_->name);
-    executor_codegen_->Init(nullptr, config_->legacy_target_map);
+    executor_codegen_->Init(nullptr, config_->primitive_targets);
     executor_codegen_->Codegen(func_module, func, mod_name);
     executor_codegen_->UpdateOutput(&ret_);
     ret_.params = executor_codegen_->GetParams();
@@ -452,13 +446,13 @@ class RelayBuildModule : public runtime::ModuleNode {
         ret_.mod = tvm::codegen::CSourceModuleCreate(";", "", Array<String>{});
       }
     } else {
-      ret_.mod = tvm::build(lowered_funcs, host_target);
+      ret_.mod = tvm::TIRToRuntime(lowered_funcs, host_target);
     }
 
     auto ext_mods = executor_codegen_->GetExternalModules();
-    ret_.mod =
-        tvm::codegen::CreateMetadataModule(ret_.params, ret_.mod, ext_mods, host_target, runtime_,
-                                           executor_codegen_->GetExecutorCodegenMetadata());
+    ret_.mod = tvm::codegen::CreateMetadataModule(ret_.params, ret_.mod, ext_mods, host_target,
+                                                  runtime_, executor_,
+                                                  executor_codegen_->GetExecutorCodegenMetadata());
     // Remove external params which were stored in metadata module.
     for (tvm::runtime::Module mod : ext_mods) {
       auto pf_var = mod.GetFunction("get_const_vars");

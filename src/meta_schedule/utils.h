@@ -21,6 +21,7 @@
 
 #include <dmlc/memory_io.h>
 #include <tvm/arith/analyzer.h>
+#include <tvm/meta_schedule/apply_history_best.h>
 #include <tvm/meta_schedule/arg_info.h>
 #include <tvm/meta_schedule/builder.h>
 #include <tvm/meta_schedule/cost_model.h>
@@ -35,9 +36,11 @@
 #include <tvm/meta_schedule/tune_context.h>
 #include <tvm/node/node.h>
 #include <tvm/node/serialization.h>
+#include <tvm/runtime/container/optional.h>
 #include <tvm/support/parallel_for.h>
 #include <tvm/tir/schedule/schedule.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -45,12 +48,60 @@
 #include "../support/array.h"
 #include "../support/base64.h"
 #include "../support/nd_int_set.h"
+#include "../support/table_printer.h"
 #include "../support/utils.h"
 #include "../tir/schedule/primitive.h"
 #include "../tir/schedule/utils.h"
 
+#define TVM_PY_LOG(logging_level, logging_func)                          \
+  ::tvm::meta_schedule::PyLogMessage(__FILE__, __LINE__, logging_func,   \
+                                     PyLogMessage::Level::logging_level) \
+      .stream()
+
 namespace tvm {
 namespace meta_schedule {
+
+/*!
+ * \brief Class to accumulate an log message on the python side. Do not use directly, instead use
+ * TVM_PY_LOG(DEBUG), TVM_PY_LOG(INFO), TVM_PY_LOG(WARNING), TVM_PY_ERROR(ERROR).
+ */
+class PyLogMessage {
+ public:
+  enum class Level : int32_t {
+    DEBUG = 10,
+    INFO = 20,
+    WARNING = 30,
+    ERROR = 40,
+    // FATAL not included
+  };
+
+  PyLogMessage(const std::string& file, int lineno, PackedFunc logging_func, Level logging_level) {
+    this->logging_func = logging_func;
+    this->logging_level = logging_level;
+  }
+  TVM_NO_INLINE ~PyLogMessage() {
+    if (this->logging_func.defined()) {
+      logging_func(static_cast<int>(logging_level), stream_.str());
+    } else {
+      if (logging_level == Level::INFO)
+        LOG(INFO) << stream_.str();
+      else if (logging_level == Level::WARNING)
+        LOG(WARNING) << stream_.str();
+      else if (logging_level == Level::ERROR)
+        LOG(ERROR) << stream_.str();
+      else if (logging_level == Level::DEBUG)
+        DLOG(INFO) << stream_.str();
+      else
+        LOG(FATAL) << stream_.str();
+    }
+  }
+  std::ostringstream& stream() { return stream_; }
+
+ private:
+  std::ostringstream stream_;
+  PackedFunc logging_func;
+  Level logging_level;
+};
 
 /*! \brief The type of the random state */
 using TRandState = support::LinearCongruentialEngine::TRandState;
@@ -148,6 +199,21 @@ inline String JSONObj2Str(const ObjectRef& json_obj) {
  * \return The string representation of the hash code
  */
 inline String SHash2Str(Workload::THashCode hash_code) { return std::to_string(hash_code); }
+
+/*!
+ * \brief Converts an TVM object to the hex string representation of its structural hash.
+ * \param obj The TVM object.
+ * \return The hex string representation of the hash code.
+ */
+inline String SHash2Hex(const ObjectRef& obj) {
+  std::ostringstream os;
+  size_t hash_code = 0;
+  if (obj.defined()) {
+    hash_code = StructuralHash()(obj);
+  }
+  os << "0x" << std::setw(16) << std::setfill('0') << std::hex << hash_code;
+  return os.str();
+}
 
 /*!
  * \brief Find the entry function of the given IRModule, i.e, functions marked by
@@ -290,12 +356,20 @@ struct ThreadedTraceApply {
                               /*rand_state=*/ForkSeed(rand_state),
                               /*debug_mode=*/0,
                               /*error_render_level=*/tir::ScheduleErrorRenderLevel::kNone);
+
     trace->ApplyToSchedule(sch, /*remove_postproc=*/true);
     sch->EnterPostproc();
+
     for (int i = 0; i < n_; ++i) {
       Item& item = items_[i];
-      if (!item.postproc->Apply(sch)) {
-        ++item.fail_counter;
+      try {
+        if (!item.postproc->Apply(sch)) {
+          ++item.fail_counter;
+          return NullOpt;
+        }
+      } catch (const std::exception& e) {
+        // Used in multi-thread, only output to screen but failure summary sent to logging
+        LOG(WARNING) << "ThreadedTraceApply::Apply failed with error " << e.what();
         return NullOpt;
       }
     }
@@ -349,6 +423,27 @@ inline int GetTargetNumCores(const Target& target) {
         << num_cores << "\"";
   }
   return num_cores;
+}
+
+/*!
+ * \brief Get the median of the running time from RunnerResult in millisecond
+ * \param results The results from RunnerResult
+ * \return The median of the running time in millisecond
+ */
+inline double GetRunMsMedian(const RunnerResult& runner_result) {
+  Array<FloatImm> run_secs = runner_result->run_secs.value();
+  ICHECK(!run_secs.empty());
+  std::vector<double> v;
+  v.reserve(run_secs.size());
+  std::transform(run_secs.begin(), run_secs.end(), std::back_inserter(v),
+                 [](const FloatImm& f) -> double { return f->value; });
+  std::sort(v.begin(), v.end());
+  int n = v.size();
+  if (n % 2 == 0) {
+    return (v[n / 2] + v[n / 2 + 1]) * 0.5 * 1000.0;
+  } else {
+    return v[n / 2] * 1000.0;
+  }
 }
 
 }  // namespace meta_schedule

@@ -18,7 +18,6 @@
 """CMSIS-NN functions for testing networks"""
 
 import platform
-
 import math
 import numpy as np
 import pytest
@@ -29,9 +28,7 @@ from tvm import relay
 
 
 def skip_if_no_reference_system(func):
-    return pytest.mark.skipif(
-        platform.machine() == "i686", reason="Reference system unavailable in i386 container"
-    )(func)
+    return tvm.testing.skip_if_32bit(reason="Reference system unavailable in i386 container")(func)
 
 
 def count_num_calls(mod):

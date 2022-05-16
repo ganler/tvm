@@ -46,6 +46,7 @@
 
 #include "../../runtime/meta_data.h"
 #include "../../target/metadata.h"
+#include "tvm/runtime/ndarray.h"
 
 namespace tvm {
 namespace relay {
@@ -82,6 +83,8 @@ class ExecutorCodegenMetadataNode : public Object {
   bool unpacked_api;
   /*! \brief the input var names that correspond to pool_inputs */
   Optional<Map<tir::Var, tir::usmp::AllocatedPoolInfo>> pool_inputs;
+  /*! \brief the I/O tensor to PoolAllocations if any*/
+  Map<String, tir::usmp::PoolAllocation> io_pool_allocations;
 
   String mod_name = "";
 
@@ -95,6 +98,7 @@ class ExecutorCodegenMetadataNode : public Object {
     v->Visit("executor", &executor);
     v->Visit("unpacked_api", &unpacked_api);
     v->Visit("pool_inputs", &pool_inputs);
+    v->Visit("io_pool_allocations", &io_pool_allocations);
   }
 
   static constexpr const char* _type_key = "MetadataObj";
@@ -106,13 +110,13 @@ class ExecutorCodegenMetadataNode : public Object {
  */
 class ExecutorCodegenMetadata : public ObjectRef {
  public:
-  TVM_DLL ExecutorCodegenMetadata(Array<tir::Var> inputs, Array<TensorType> input_tensor_types,
-                                  Array<String> outputs, Array<TensorType> output_tensor_types,
-                                  Array<tir::Var> pools, Array<String> devices, String executor,
-                                  String mod_name, String interface_api = "packed",
-                                  bool unpacked_api = false,
-                                  Map<tir::Var, tir::usmp::AllocatedPoolInfo> pool_inputs =
-                                      Map<tir::Var, tir::usmp::AllocatedPoolInfo>());
+  TVM_DLL ExecutorCodegenMetadata(
+      Array<tir::Var> inputs, Array<TensorType> input_tensor_types, Array<String> outputs,
+      Array<TensorType> output_tensor_types, Array<tir::Var> pools, Array<String> devices,
+      String executor, String mod_name, String interface_api = "packed", bool unpacked_api = false,
+      Map<tir::Var, tir::usmp::AllocatedPoolInfo> pool_inputs =
+          Map<tir::Var, tir::usmp::AllocatedPoolInfo>(),
+      Map<String, tir::usmp::PoolAllocation> io_pool_allocations = {{}});
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(ExecutorCodegenMetadata, ObjectRef,
                                         ExecutorCodegenMetadataNode);
@@ -237,6 +241,7 @@ struct ConstantUpdater : public ExprVisitor {
 
   void VisitExpr_(const ConstantNode* cn) final {
     std::string name = symbol_ + "_const_" + std::to_string(const_idx_++);
+    VLOG(1) << "Binding " << name << " to constant of type " << PrettyPrint(cn->checked_type());
     (*params_)[name] = cn->data;
   }
 
@@ -386,36 +391,18 @@ inline std::string DType2String(const tvm::DataType dtype) {
  * \param params params dict
  * \return relay::Function
  */
-inline relay::Function BindParamsByName(
-    relay::Function func, const std::unordered_map<std::string, runtime::NDArray>& params) {
-  std::unordered_map<std::string, relay::Var> name_dict;
-  std::unordered_set<relay::Var, ObjectPtrHash, ObjectPtrEqual> repeat_var;
-  for (auto arg : func->params) {
-    const auto& name = arg->name_hint();
-    if (name_dict.count(name)) {
-      repeat_var.insert(name_dict[name]);
-    } else {
-      name_dict[name] = arg;
-    }
-  }
+relay::Function BindParamsByName(relay::Function func,
+                                 const std::unordered_map<std::string, runtime::NDArray>& params);
 
-  std::unordered_map<relay::Var, Expr, ObjectPtrHash, ObjectPtrEqual> bind_dict;
-  for (auto& kv : params) {
-    if (name_dict.count(kv.first) == 0) {
-      continue;
-    }
-    auto arg = name_dict.at(kv.first);
-    if (repeat_var.count(arg)) {
-      LOG(FATAL) << "Multiple args in the function have name " << kv.first;
-    }
-    bind_dict[arg] = Constant(kv.second);
-  }
-  Expr bound_expr = relay::Bind(func, bind_dict);
-  Function ret = Downcast<Function>(bound_expr);
-  ICHECK(ret.defined()) << "The returning type is expected to be a Relay Function."
-                        << "\n";
-  return ret;
-}
+/*!
+ * \brief Bind params to the main function in Relay module, using BindParamsByName
+ * \param mod Relay module
+ * \param params params dict
+ */
+void BindParamsInModule(IRModule mod,
+                        const std::unordered_map<std::string, runtime::NDArray>& params);
+
+void BindParamsInModule(IRModule mod, Map<String, runtime::NDArray> params);
 
 /*!
  * \brief Extract the shape from a Relay tensor type.
@@ -466,8 +453,12 @@ inline const CallNode* GetRootCall(const CallNode* current_call, int depth,
   }
 
   ICHECK_GT(current_call->args.size(), 0);
-
-  const auto* next_call = current_call->args[0].as<CallNode>();
+  size_t valid_node_idx = 0;
+  while (valid_node_idx < current_call->args.size() &&
+         current_call->args[valid_node_idx].as<VarNode>()) {
+    valid_node_idx++;
+  }
+  const auto* next_call = current_call->args[valid_node_idx].as<CallNode>();
   return GetRootCall(next_call, depth - 1, expected_op_names);
 }
 
@@ -525,11 +516,11 @@ inline bool IsMetaScheduleEnabled() {
  * difference. This function unifies the shared optimization pass prefix between vm and graph
  * runtime, and returns the pass prefix given the backend type.
  *
- * \param is_homogenous True if all primitives are to be executed on the same device and target.
+ * \param is_homogeneous True if all primitives are to be executed on the same device and target.
  * \param is_vm True if passes are to be used for the vm executor.
  * \return An array of passes.
  */
-Array<Pass> GetPassPrefix(bool is_homogenous, bool is_vm);
+Array<Pass> GetPassPrefix(bool is_homogeneous, bool is_vm);
 
 /*! \brief Target hash function */
 struct TargetStrHash {

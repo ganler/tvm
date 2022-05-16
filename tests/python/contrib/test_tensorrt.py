@@ -15,30 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 import tvm.testing
-from curses import tparm
-from unittest import result
 import numpy as np
-import time
 import pytest
 import itertools
-import pdb
 
 
 import tvm
-from tvm.relay.op.contrib.bnns import dtype_is_supported
 import tvm.relay.testing
 
-from tvm import relay, runtime
+from tvm import relay
 from tvm.relay.op.contrib import tensorrt
-from tvm.contrib import graph_executor, utils
-from tvm.runtime.vm import VirtualMachine
 
 from tvm.relay import Any, GlobalVar
-from tvm.relay.transform import FirstOrderGradient, InferType
-from tvm.relay.transform.transform import ToMixedPrecision
 
 from tvm.relay.expr_functor import ExprVisitor
-from typing import Dict, Tuple, Union
+from typing import Tuple
 from tvm.contrib.download import download
 from tvm.relay.op.contrib import tensorrt
 
@@ -78,7 +69,7 @@ def assert_result_dict_holds(result_dict, dtype="float16"):
             if dtype == "float16":
                 tvm.testing.assert_allclose(r1, r2, rtol=1e-1, atol=1e-1)
             else:
-                tvm.testing.assert_allclose(r1, r2, rtol=1e-3, atol=1e-3)
+                tvm.testing.assert_allclose(r1, r2, rtol=1e-3, atol=5e-3)
 
 
 def set_func_attr(func, compile_name, symbol_name):
@@ -105,6 +96,7 @@ def run_and_verify_func(config, target="cuda", run_module=True, data_type="float
     data_type: str
         Check between single and double floating precision
     """
+    np.random.seed(42)
     f, input_shapes, is_param = config
     params = {
         x: np.random.uniform(-1, 1, input_shapes[x]).astype(dtype=data_type) for x in is_param
@@ -125,7 +117,9 @@ def run_and_verify_func(config, target="cuda", run_module=True, data_type="float
                 result_key = mode + ("_trt" if use_trt else "")
                 if use_trt:
                     mod = relay.transform.InferType()(mod)
-                    mod, config = tensorrt.partition_for_tensorrt(mod, params)
+                    mod, config = tensorrt.partition_for_tensorrt(
+                        mod, params, use_fp16=data_type == "float16"
+                    )
                     with tvm.transform.PassContext(
                         opt_level=3, config={"relay.ext.tensorrt.options": config}
                     ):
@@ -144,55 +138,6 @@ def run_and_verify_func(config, target="cuda", run_module=True, data_type="float
 
                 if run_module:
                     assert_result_dict_holds(result_dict, data_type)
-
-
-def run_and_verify_model(model, run_module):
-    import mxnet as mx
-    from mxnet.gluon.model_zoo.vision import get_model
-
-    def check_trt_used(mod):
-        num_trt_subgraphs = sum(
-            [1 if gv.name_hint == "tensorrt_0" else 0 for gv in mod.get_global_vars()]
-        )
-        assert num_trt_subgraphs == 1
-
-    def compile_and_run(mod, params, i_data, mode="vm", use_trt=True):
-        assert mode in ["graph", "vm"]
-
-        if use_trt:
-            mod, config = tensorrt.partition_for_tensorrt(mod, params)
-            check_trt_used(mod)
-            with tvm.transform.PassContext(
-                opt_level=3, config={"relay.ext.tensorrt.options": config}
-            ):
-                func = relay.create_executor(
-                    mode, mod=mod, device=tvm.cuda(0), target="cuda"
-                ).evaluate()
-        else:
-            with tvm.transform.PassContext(opt_level=3):
-                func = relay.create_executor(
-                    mode, mod=mod, device=tvm.cuda(0), target="cuda"
-                ).evaluate()
-
-        res = func(i_data, **params) if run_module else None
-        return res
-
-    dtype = "float32"
-    input_shape = (1, 3, 224, 224)
-    i_data = np.random.uniform(-1, 1, input_shape).astype(dtype)
-    block = get_model(model, pretrained=True)
-    mod, params = relay.frontend.from_mxnet(block, shape={"data": input_shape}, dtype=dtype)
-
-    result_dict = dict()
-    for mode in ["vm", "graph"]:
-        for use_trt in [True, False]:
-            result_key = mode + ("_trt" if use_trt else "")
-            result_dict[result_key] = compile_and_run(
-                mod, params, i_data, mode=mode, use_trt=use_trt
-            )
-
-    if run_module:
-        assert_result_dict_holds(result_dict)
 
 
 def test_tensorrt_simple(run_module):
@@ -234,7 +179,6 @@ def test_tensorrt_simple(run_module):
                 if run_module:
                     result_dict[result_key] = func(x_data, y_data, z_data)
 
-        print(result_dict)
         if run_module:
             assert_result_dict_holds(result_dict)
 
@@ -276,113 +220,6 @@ def test_tensorrt_not_compatible(run_module):
             ).evaluate()
             if run_module:
                 results = func(x_data)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_tensorrt_serialize_graph_executor(run_module):
-    import mxnet as mx
-    from mxnet.gluon.model_zoo.vision import get_model
-
-    data_shape = (1, 3, 224, 224)
-    data_type = "float32"
-    i_data = np.random.uniform(0, 1, data_shape).astype(data_type)
-    block = get_model("resnet18_v1", pretrained=True)
-    mod, params = relay.frontend.from_mxnet(block, shape={"data": data_shape}, dtype=data_type)
-    mod, config = tensorrt.partition_for_tensorrt(mod)
-    tmpdir = utils.tempdir()
-
-    def compile_graph(mod, params):
-        with tvm.transform.PassContext(opt_level=3, config={"relay.ext.tensorrt.options": config}):
-            graph, lib, params = relay.build(mod, params=params, target="cuda")
-            params = runtime.save_param_dict(params)
-        return graph, lib, params
-
-    def run_graph(graph, lib, params):
-        mod_ = graph_executor.create(graph, lib, device=tvm.cuda(0))
-        mod_.load_params(params)
-        mod_.run(data=i_data)
-        res = mod_.get_output(0)
-        return res
-
-    def save_graph(graph, lib, params):
-        # Serialize
-        with open(tmpdir.relpath("compiled.json"), "w") as f_graph_json:
-            f_graph_json.write(graph)
-        with open(tmpdir.relpath("compiled.params"), "wb") as f_params:
-            f_params.write(params)
-        lib.export_library(tmpdir.relpath("compiled.so"))
-
-    def load_graph():
-        # Deserialize
-        with open(tmpdir.relpath("compiled.json"), "r") as f_graph_json:
-            graph = f_graph_json.read()
-        with open(tmpdir.relpath("compiled.params"), "rb") as f_params:
-            params = bytearray(f_params.read())
-        lib = tvm.runtime.load_module(tmpdir.relpath("compiled.so"))
-        return graph, lib, params
-
-    # Test serialization with graph executor
-    graph, lib, graph_params = compile_graph(mod, params)
-    save_graph(graph, lib, graph_params)
-    loaded_graph, loaded_lib, loaded_params = load_graph()
-
-    if run_module:
-        result_dict = dict()
-        result_dict["graph"] = run_graph(graph, lib, graph_params)
-        result_dict["graph_ref"] = run_graph(loaded_graph, loaded_lib, loaded_params)
-        assert_result_dict_holds(result_dict)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_tensorrt_serialize_vm(run_module):
-    import mxnet as mx
-    from mxnet.gluon.model_zoo.vision import get_model
-
-    data_shape = (1, 3, 224, 224)
-    data_type = "float32"
-    i_data = np.random.uniform(0, 1, data_shape).astype(data_type)
-    block = get_model("resnet18_v1", pretrained=True)
-    mod, params = relay.frontend.from_mxnet(block, shape={"data": data_shape}, dtype=data_type)
-    mod, config = tensorrt.partition_for_tensorrt(mod)
-    tmpdir = utils.tempdir()
-
-    def compile_vm(mod, params):
-        with tvm.transform.PassContext(opt_level=3, config={"relay.ext.tensorrt.options": config}):
-            vm_exec = relay.vm.compile(mod, target="cuda", params=params)
-            code, lib = vm_exec.save()
-        return code, lib
-
-    def run_vm(code, lib):
-        vm_exec = tvm.runtime.vm.Executable.load_exec(code, lib)
-        vm = VirtualMachine(vm_exec, tvm.cuda(0))
-        result = vm.invoke("main", data=i_data)
-        return result
-
-    def save_vm(code, lib):
-        # save and load the code and lib file.
-        lib.export_library(tmpdir.relpath("path_lib.so"))
-        with open(tmpdir.relpath("path_code.ro"), "wb") as fo:
-            fo.write(code)
-
-    def load_vm():
-        lib = tvm.runtime.load_module(tmpdir.relpath("path_lib.so"))
-        code = bytearray(open(tmpdir.relpath("path_code.ro"), "rb").read())
-        return lib, code
-
-    # Test serialization with VM
-    code_vm, lib_vm = compile_vm(mod, params)
-    save_vm(code_vm, lib_vm)
-    loaded_lib_vm, loaded_code_vm = load_vm()
-
-    if run_module:
-        result_dict = dict()
-        result_dict["vm"] = run_vm(code_vm, lib_vm)
-        result_dict["vm_ref"] = run_vm(loaded_code_vm, loaded_lib_vm)
-        assert_result_dict_holds(result_dict)
 
 
 def test_conv1d(run_module):
@@ -750,9 +587,13 @@ def test_reshape(run_module):
         f = relay.Function([x], out)
         return f, {"x": x_shape}, []
 
-    run_and_verify_func(get_graph((1, 1, 1, 10), (-1, 10)), run_module=run_module)
-    run_and_verify_func(get_graph((1, 10, 2, 3), (1, -1)), run_module=run_module)
-    run_and_verify_func(get_graph((1, 1, 2, 3), (1, 6)), run_module=run_module)
+    run_and_verify_func(
+        get_graph((1, 1, 1, 10), (-1, 10)), run_module=run_module, data_type="float16"
+    )
+    run_and_verify_func(
+        get_graph((1, 10, 2, 3), (1, -1)), run_module=run_module, data_type="float16"
+    )
+    run_and_verify_func(get_graph((1, 1, 2, 3), (1, 6)), run_module=run_module, data_type="float16")
 
 
 class AreOpsOnGraph(ExprVisitor):
@@ -887,7 +728,7 @@ def test_float_const16(run_module):
         f = relay.Function([x], out)
         return f, {"x": x_shape}, []
 
-    run_and_verify_func(get_graph(), run_module=run_module)
+    run_and_verify_func(get_graph(), run_module=run_module, data_type="float16")
 
 
 def test_pad(run_module):
@@ -1212,8 +1053,8 @@ def test_multiple_outputs(run_module):
 
 def test_conv3d(run_module):
     def get_graph(
-        x_shape=(1, 32, 8, 8, 8),
-        k_shape=(16, 32, 3, 3, 3),
+        x_shape=(1, 24, 8, 8, 8),
+        k_shape=(16, 24, 3, 3, 3),
         groups=1,
         padding=(0, 0, 0),
         strides=(1, 1, 1),
@@ -1300,62 +1141,6 @@ def test_conv3d_transpose(run_module):
     run_and_verify_func(
         get_graph(strides=(2, 2, 2), output_padding=(1, 1, 1)), run_module=run_module
     )
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_alexnet(run_module):
-    run_and_verify_model("alexnet", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_resnet18_v1(run_module):
-    run_and_verify_model("resnet18_v1", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_resnet18_v2(run_module):
-    run_and_verify_model("resnet18_v2", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_squeezenet(run_module):
-    run_and_verify_model("squeezenet1.0", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_mobilenet(run_module):
-    run_and_verify_model("mobilenet0.25", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_mobilenet_v2(run_module):
-    run_and_verify_model("mobilenetv2_0.25", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_vgg11(run_module):
-    run_and_verify_model("vgg11", run_module)
-
-
-@pytest.mark.xfail(
-    reason=("Currently failing test.  See tracking issue https://github.com/apache/tvm/issues/8901")
-)
-def test_densenet121(run_module):
-    run_and_verify_model("densenet121", run_module)
 
 
 @pytest.mark.xfail(
@@ -1539,10 +1324,7 @@ def test_maskrcnn_resnet50(run_module) -> None:
         """
         input_shape = (1, 3, in_size, in_size)
         img_path = "test_street_small.jpg"
-        img_url = (
-            "https://raw.githubusercontent.com/dmlc/web-data/"
-            "master/gluoncv/detection/street_small.jpg"
-        )
+        img_url = "https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/detection/street_small.jpg"
         download(img_url, img_path)
         import cv2
 

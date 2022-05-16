@@ -24,6 +24,12 @@ RUN apt-get update --fix-missing
 COPY install/ubuntu_install_core.sh /install/ubuntu_install_core.sh
 RUN bash /install/ubuntu_install_core.sh
 
+COPY install/ubuntu_install_googletest.sh /install/ubuntu_install_googletest.sh
+RUN bash /install/ubuntu_install_googletest.sh
+
+COPY install/ubuntu1804_install_python.sh /install/ubuntu1804_install_python.sh
+RUN bash /install/ubuntu1804_install_python.sh
+
 COPY install/ubuntu1804_install_python_venv.sh /install/ubuntu1804_install_python_venv.sh
 RUN bash /install/ubuntu1804_install_python_venv.sh
 ENV PATH=/opt/tvm-venv/bin:/opt/zephyr-sdk/sysroots/x86_64-pokysdk-linux/usr/bin:$PATH
@@ -63,6 +69,7 @@ RUN bash /install/ubuntu_install_tflite.sh
 # sccache
 COPY install/ubuntu_install_sccache.sh /install/ubuntu_install_sccache.sh
 RUN bash /install/ubuntu_install_sccache.sh
+ENV PATH /opt/sccache:$PATH
 
 # Zephyr SDK deps
 COPY install/ubuntu_install_zephyr.sh /install/ubuntu_install_zephyr.sh
@@ -87,6 +94,11 @@ RUN bash /install/ubuntu_install_arduino.sh
 # Install ONNX
 COPY install/ubuntu_install_onnx.sh /install/ubuntu_install_onnx.sh
 RUN bash /install/ubuntu_install_onnx.sh
+
+# Install CMSIS_NN
+COPY install/ubuntu_install_cmsis.sh /install/ubuntu_install_cmsis.sh
+RUN bash /install/ubuntu_install_cmsis.sh /opt/arm/ethosu/cmsis
+ENV CMSIS_PATH=/opt/arm/ethosu/cmsis/
 
 # Arm(R) Ethos(TM)-U NPU driver
 COPY install/ubuntu_install_ethosu_driver_stack.sh /install/ubuntu_install_ethosu_driver_stack.sh

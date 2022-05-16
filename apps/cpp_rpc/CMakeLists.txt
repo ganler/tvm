@@ -45,9 +45,15 @@ target_include_directories(
   PUBLIC DMLC_PATH
 )
 
-if (BUILD_FOR_ANDROID AND USE_HEXAGON_SDK)
-  find_hexagon_sdk_root("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}")
-  link_directories(${HEXAGON_REMOTE_ROOT})
+if (BUILD_FOR_ANDROID AND USE_HEXAGON)
+  get_hexagon_sdk_property("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}"
+    DSPRPC_LIB DSPRPC_LIB_DIRS
+  )
+  if(DSPRPC_LIB_DIRS)
+    link_directories(${DSPRPC_LIB_DIRS})
+  else()
+    message(WARNING "Could not locate some Hexagon SDK components")
+  endif()
   list(APPEND TVM_RPC_LINKER_LIBS cdsprpc log)
 endif()
 

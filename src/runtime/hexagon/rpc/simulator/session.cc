@@ -188,7 +188,7 @@ MaybeRange<T> to_range(const MaybeString& str) {
 
 class SimulatorRPCChannel final : public RPCChannel {
  public:
-  SimulatorRPCChannel(std::string args);
+  SimulatorRPCChannel(int stack_size, std::string args);
   ~SimulatorRPCChannel() final;
   size_t Send(const void* data, size_t size) final;
   size_t Recv(void* data, size_t size) final;
@@ -212,6 +212,11 @@ class SimulatorRPCChannel final : public RPCChannel {
     std::string qurt_root;  // sdk_root/rtos/qurt/computevNN.
     std::string runelf;     // Path to runelf.pbn.
     std::string runmain;    // Path to run_main_on_hexagon.
+  };
+
+  struct Message_ {
+    Message msg;
+    std::string str() const;
   };
 
   Message SendMsg(Message msg);
@@ -461,9 +466,33 @@ std::string SimulatorRPCChannel::Cpu_::str() const {
   return default_cpu_;
 }
 
+std::string SimulatorRPCChannel::Message_::str() const {
+  switch (msg.code) {
+    case Message::kNone:
+      return "kNone";
+    case Message::kAck:
+      return "kAck";
+    case Message::kTerminate:
+      return "kTerminate";
+    case Message::kReceiveStart:
+      return "kReceiveStart";
+    case Message::kReceiveEnd:
+      return "kReceiveEnd";
+    case Message::kSendStart:
+      return "kSendStart";
+    case Message::kSendEnd:
+      return "kSendEnd";
+    default:
+      break;
+  }
+}
+
 SimulatorRPCChannel::SDKInfo_::SDKInfo_(const std::string& sdk_root, const std::string& cpu)
     : root(sdk_root) {
-  qurt_root = root + "/rtos/qurt/compute" + cpu;
+  // For v69 chips, still look for v68 in the directory names.
+  std::string check_cpu = cpu == "v69" ? "v68" : cpu;
+
+  qurt_root = root + "/rtos/qurt/compute" + check_cpu;
   runelf = qurt_root + "/sdksim_bin/runelf.pbn";
 
   // The "run_main_on_hexagon_sim" binary lives in a subdirectory that looks
@@ -480,7 +509,7 @@ SimulatorRPCChannel::SDKInfo_::SDKInfo_(const std::string& sdk_root, const std::
     std::string name = d->d_name;
     // Note: The first substr is always safe, and the second only executes
     // when "name" is at least 13 characters long.
-    if (name.substr(0, 13) == "hexagon_toolv" && name.substr(name.size() - 3, 3) == cpu) {
+    if (name.substr(0, 13) == "hexagon_toolv" && name.substr(name.size() - 3, 3) == check_cpu) {
       dir_names.push_back(name);
     }
   }
@@ -517,10 +546,10 @@ detail::Optional<HEXAPI_Cpu> SimulatorRPCChannel::GetCPU(const detail::MaybeStri
       .Default(none);
 }
 
-SimulatorRPCChannel::SimulatorRPCChannel(std::string args) {
-  const auto* api_v2 = tvm::runtime::Registry::Get("device_api.hexagon.v2");
-  ICHECK(api_v2 != nullptr);
-  tvm::runtime::Registry::Register("device_api.hexagon", true).set_body(*api_v2);
+SimulatorRPCChannel::SimulatorRPCChannel(int stack_size, std::string args) {
+  const auto* api = tvm::runtime::Registry::Get("device_api.hexagon");
+  ICHECK(api != nullptr);
+  tvm::runtime::Registry::Register("device_api.cpu", true).set_body(*api);
 
   const char* sdk_root_env = std::getenv("HEXAGON_SDK_ROOT");
   ICHECK(sdk_root_env != nullptr) << "Please set HEXAGON_SDK_ROOT";
@@ -570,7 +599,9 @@ SimulatorRPCChannel::SimulatorRPCChannel(std::string args) {
   CHECKED_CALL(ConfigureCosim, cosim_file_);
   CHECKED_CALL(ConfigureExecutableBinary, sdk.runelf.c_str());
 
-  std::string cmdline = sdk.runelf + " " + sdk.runmain + " -- libhexagon_rpc_sim.so";
+  std::string stack_arg =
+      stack_size > 0 ? std::string(" -stack_size=") + std::to_string(stack_size) : "";
+  std::string cmdline = sdk.runelf + " " + sdk.runmain + stack_arg + " -- libhexagon_rpc_sim.so";
   char* parg = &cmdline[0];
   CHECKED_CALL(ConfigureAppCommandLine, 1, &parg);
 
@@ -646,8 +677,13 @@ Message SimulatorRPCChannel::SendMsg(Message msg) {
     HEX_4u_t result;
 
     core = sim_->Run(&result);
-    ICHECK_EQ(core, HEX_CORE_BREAKPOINT);
+    Core_ core_ = {core};
+    ICHECK_EQ(core, HEX_CORE_BREAKPOINT)
+        << "Expecting HEX_CORE_BREAKPOINT, received: " << core_.str();
   };
+
+  Message_ msg_ = {msg};
+  LOG(INFO) << "Sending message: " << msg_.str();
 
   WriteToProcess(message_buffer_v_, &msg, sizeof msg);
   run();
@@ -1308,10 +1344,12 @@ detail::Optional<HEXAPI_Nullptr> SimulatorRPCChannel::to_nullptr(const detail::M
 
 TVM_REGISTER_GLOBAL("tvm.contrib.hexagon.create_hexagon_session")
     .set_body([](TVMArgs args, TVMRetValue* rv) {
+      ICHECK(args.size() >= 4) << args.size() << " is less than 4";
+
       std::string session_name = args[0];
-      // For target, the second parameter is remote_stack_size_bytes, ignore it.
+      int stack_size = args[1];
       std::string sim_args = args[2];
-      auto channel = std::make_unique<SimulatorRPCChannel>(sim_args);
+      auto channel = std::make_unique<SimulatorRPCChannel>(stack_size, sim_args);
       std::shared_ptr<RPCEndpoint> endpoint =
           RPCEndpoint::Create(std::move(channel), session_name, "", nullptr);
       std::shared_ptr<RPCSession> session = CreateClientSession(endpoint);

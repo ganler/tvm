@@ -72,6 +72,8 @@ cl::BufferDescriptor::MemoryLayout cl::BufferDescriptor::MemoryLayoutFromScope(
     return cl::BufferDescriptor::MemoryLayout::kImage2DActivation;
   } else if (mem_scope.value() == "global.texture-weight") {
     return cl::BufferDescriptor::MemoryLayout::kImage2DWeight;
+  } else if (mem_scope.value() == "global.texture-nhwc") {
+    return cl::BufferDescriptor::MemoryLayout::kImage2DNHWC;
   }
   LOG(FATAL) << "No memory layout defined for memory of scope: " << mem_scope.value();
   return cl::BufferDescriptor::MemoryLayout::kBuffer1D;
@@ -85,6 +87,8 @@ String cl::BufferDescriptor::ScopeFromMemoryLayout(cl::BufferDescriptor::MemoryL
       return "global.texture";
     case cl::BufferDescriptor::MemoryLayout::kImage2DWeight:
       return "global.texture-weight";
+    case cl::BufferDescriptor::MemoryLayout::kImage2DNHWC:
+      return "global.texture-nhwc";
   }
   LOG(FATAL) << "No scope corresponding to the provided memory layout: "
              << static_cast<int>(layout);
@@ -285,6 +289,7 @@ void OpenCLWorkspace::CopyDataFromTo(DLTensor* from, DLTensor* to, TVMStreamHand
         break;
       case cl::BufferDescriptor::MemoryLayout::kImage2DActivation:
       case cl::BufferDescriptor::MemoryLayout::kImage2DWeight:
+      case cl::BufferDescriptor::MemoryLayout::kImage2DNHWC:
         auto image_info = GetImageInfo(from_desc, from);
         // TODO(csullivan): Support calculating row_pitch correctly in the case of reuse.
         // Note that when utilizing texture pools for memory reuse, the allocated image
@@ -306,6 +311,7 @@ void OpenCLWorkspace::CopyDataFromTo(DLTensor* from, DLTensor* to, TVMStreamHand
         break;
       case cl::BufferDescriptor::MemoryLayout::kImage2DActivation:
       case cl::BufferDescriptor::MemoryLayout::kImage2DWeight:
+      case cl::BufferDescriptor::MemoryLayout::kImage2DNHWC:
         auto image_info = GetImageInfo(to_desc, to);
         OPENCL_CALL(clEnqueueWriteImage(
             this->GetQueue(to->device), to_desc->buffer, CL_FALSE, image_info.origin,
@@ -426,25 +432,26 @@ void OpenCLWorkspace::Init(const std::string& type_key, const std::string& devic
   ICHECK_EQ(this->queues.size(), 0U);
   for (size_t i = 0; i < this->devices.size(); ++i) {
     cl_device_id did = this->devices[i];
-#ifdef USE_PROFILER
-    this->queues.push_back(
-        clCreateCommandQueue(this->context, did, CL_QUEUE_PROFILING_ENABLE, &err_code));
-#else
     this->queues.push_back(clCreateCommandQueue(this->context, did, 0, &err_code));
-#endif
     OPENCL_CHECK_ERROR(err_code);
   }
   this->events.resize(this->devices.size());
   initialized_ = true;
 }
 
-TVM_REGISTER_GLOBAL("device_api.opencl.AllocTexture").set_body([](TVMArgs args, TVMRetValue* rv) {
-  int device_type = args[0];
-  int device_id = args[1];
-  int width = args[2];
-  int height = args[3];
-  int dtype_code_hint = args[4];
-  int dtype_bits_hint = args[5];
+TVM_REGISTER_GLOBAL("device_api.opencl.alloc_nd").set_body([](TVMArgs args, TVMRetValue* rv) {
+  int32_t device_type = args[0];
+  int32_t device_id = args[1];
+  int32_t dtype_code_hint = args[2];
+  int32_t dtype_bits_hint = args[3];
+  std::string scope = args[4];
+  CHECK(scope.find("texture") != std::string::npos);
+  int64_t ndim = args[5];
+  CHECK_EQ(ndim, 2);
+  int64_t* shape = static_cast<int64_t*>(static_cast<void*>(args[6]));
+  int64_t width = shape[0];
+  int64_t height = shape[1];
+
   Device dev;
   dev.device_type = static_cast<DLDeviceType>(device_type);
   dev.device_id = device_id;
@@ -459,10 +466,12 @@ TVM_REGISTER_GLOBAL("device_api.opencl.AllocTexture").set_body([](TVMArgs args, 
                                    type_hint);
 });
 
-TVM_REGISTER_GLOBAL("device_api.opencl.FreeTexture").set_body([](TVMArgs args, TVMRetValue* rv) {
-  int device_type = args[0];
-  int device_id = args[1];
-  void* data = args[2];
+TVM_REGISTER_GLOBAL("device_api.opencl.free_nd").set_body([](TVMArgs args, TVMRetValue* rv) {
+  int32_t device_type = args[0];
+  int32_t device_id = args[1];
+  std::string scope = args[2];
+  CHECK(scope.find("texture") != std::string::npos);
+  void* data = args[3];
   OpenCLWorkspace* ptr = OpenCLWorkspace::Global();
   Device dev;
   dev.device_type = static_cast<DLDeviceType>(device_type);

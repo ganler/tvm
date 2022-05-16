@@ -16,6 +16,7 @@
 # under the License.
 # pylint: disable=import-self, invalid-name, unused-argument
 """Unit tests for various models and operators"""
+from contextlib import suppress
 import os
 import sys
 from time import time
@@ -36,8 +37,9 @@ from tvm.contrib import cudnn
 import pytest
 
 sys.setrecursionlimit(10000)
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def list_ops(expr):
@@ -114,57 +116,6 @@ def load_model(model_name):
     except ModuleNotFoundError:
         raise ModuleNotFoundError("Please install pretrainedmodels.pytorch")
     raise RuntimeError("Model not supported")
-
-
-def confidence_interval(mean, stdev, count, alpha=0.01):
-    """Returns the lower and upper bounds of the confidence interval of a random
-    variable. Confidence is 1 - alpha (default confidence is 99%)."""
-    stdval = tdistr.ppf(1 - alpha / 2, count - 1)
-    lower, upper = mean + np.array([-1, 1]) * stdval * stdev / np.sqrt(count)
-    return lower, upper
-
-
-def measure_latency(model, input_shapes, output_shapes, thresh, dryruns=40):
-    """Compute the latency of the given model"""
-    latencies = []
-    count = 0
-    while True:
-        if isinstance(model, Module):
-            input_data = [torch.rand(shape).float() for shape in input_shapes]
-            if torch.cuda.is_available():
-                input_data = list(map(lambda x: x.cuda(), input_data))
-                model = model.cuda()
-            t_start = time()
-            with torch.no_grad():
-                model(*input_data)
-            t_end = time()
-            latencies.append(t_end - t_start)
-        else:
-            input_data = {}
-            for i, shape in enumerate(input_shapes):
-                name = "input" + str(i)
-                arr = np.random.random(shape).astype("float32")
-                input_data[name] = tvm.nd.array(arr)
-            t_start = time()
-            model.set_input(**input_data)
-            model.run()
-            for i, shape in enumerate(output_shapes):
-                arr = np.zeros(shape).astype("float32")
-                model.get_output(i, tvm.nd.array(arr))
-            t_end = time()
-        count += 1
-        if count < dryruns:
-            continue
-        latencies.append(t_end - t_start)
-        mean = np.mean(latencies)
-        stdev = np.std(latencies)
-        sample_size = len(latencies)
-        if sample_size > dryruns:
-            lower, upper = confidence_interval(mean, stdev, sample_size)
-            est = (upper + lower) / 2
-            err = (upper - lower) / 2
-            if err < thresh:
-                return est
 
 
 def verify_model(
@@ -244,7 +195,8 @@ def verify_model(
 
     del model_name
     del baseline_model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # Single operator tests
@@ -389,7 +341,17 @@ def test_min_max():
         def forward(self, lhs, rhs):
             return torch.min(lhs, rhs)
 
-    input_data = [torch.rand((10, 10)), torch.rand((10, 10))]
+    class Max4(Module):
+        def forward(self, inp):
+            out = torch.amax(inp, (1, 2), keepdim=True)
+            return out
+
+    class Min4(Module):
+        def forward(self, inp):
+            out = torch.amin(inp, (0, 3), keepdim=False)
+            return out
+
+    input_data = [torch.rand((10, 10, 10, 10)), torch.rand((10, 10, 10, 10))]
 
     verify_model(Max(), input_data=input_data[0])
     verify_model(Min(), input_data=input_data[0])
@@ -397,6 +359,8 @@ def test_min_max():
     verify_model(Min2(), input_data=input_data[0])
     verify_model(Max3(), input_data=input_data)
     verify_model(Min3(), input_data=input_data)
+    verify_model(Max4(), input_data=input_data[0])
+    verify_model(Min4(), input_data=input_data[0])
 
 
 @tvm.testing.uses_gpu
@@ -1289,17 +1253,28 @@ def test_forward_reshape():
 
 @tvm.testing.uses_gpu
 def test_flatten():
-    class Flatten(Module):
-        def forward(self, x):
-            return torch.flatten(x)
+    def _test_flatten(start_dim, end_dim):
+        return lambda inp: torch.flatten(inp, start_dim, end_dim)
 
-    class BatchFlatten(Module):
-        def forward(self, x):
-            return torch.flatten(x, start_dim=1)
+    inp = torch.rand((3, 5, 2, 2))
 
-    inp = torch.rand((5, 2, 2))
-    verify_model(Flatten(), input_data=inp)
-    verify_model(BatchFlatten(), input_data=inp)
+    # [3, 5, 2, 2] -> [60]
+    verify_model(_test_flatten(0, -1), inp)
+    verify_model(_test_flatten(0, 3), inp)
+    verify_model(_test_flatten(-4, 3), inp)
+    verify_model(_test_flatten(-4, -1), inp)
+
+    # [3, 5, 2, 2] -> [3, 5, 2, 2]
+    verify_model(_test_flatten(3, -1), inp)
+    verify_model(_test_flatten(-1, -1), inp)
+    verify_model(_test_flatten(0, -4), inp)
+    verify_model(_test_flatten(-4, -4), inp)
+
+    # [3, 5, 2, 2] -> [3, 10, 2]
+    verify_model(_test_flatten(1, 2), inp)
+    verify_model(_test_flatten(1, -2), inp)
+    verify_model(_test_flatten(-3, 2), inp)
+    verify_model(_test_flatten(-3, -2), inp)
 
 
 @tvm.testing.uses_gpu
@@ -2182,7 +2157,7 @@ def test_vgg11_bn():
 def test_custom_conversion_map():
     def get_roi_align():
         pool_size = 5
-        n_channels = 2 * (pool_size ** 2)
+        n_channels = 2 * (pool_size**2)
         x = torch.rand(2, n_channels, 10, 10)
         rois = torch.tensor(
             [
@@ -3309,8 +3284,13 @@ def test_forward_unary():
         def forward(self, *args):
             return torch.log1p(args[0])
 
+    class Square(Module):
+        def forward(self, *args):
+            return torch.square(args[0])
+
     input_shape = [1, 3, 10, 10]
     input_data = torch.rand(input_shape).float()
+    verify_model(Square().float().eval(), input_data=input_data)
     verify_model(Sqrt1().float().eval(), input_data=input_data)
     verify_model(RSqrt1().float().eval(), input_data=input_data)
     verify_model(Ceil1().float().eval(), input_data=input_data)
@@ -4146,6 +4126,37 @@ def test_einsum():
     verify_model(test_fn("ij,jk,km->im"), [x, y, z])
 
 
+def test_stft():
+    def test_fn(n_fft, hop_length, win_length, center, pad_mode, normalized, onesided):
+        return lambda input, window=None: torch.stft(
+            input=input,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=window,
+            center=center,
+            pad_mode=pad_mode,
+            normalized=normalized,
+            onesided=onesided,
+        )
+
+    input = torch.rand([1, 12]).float()
+    window = torch.tensor([2, 3, 4], dtype=torch.int32)
+    targets = ["llvm", "cuda"]
+    verify_trace_model(test_fn(3, 3, 3, False, "constant", False, True), [input, window], targets)
+    verify_trace_model(test_fn(3, 3, 3, True, "constant", False, True), [input, window], targets)
+    verify_trace_model(test_fn(3, 3, 3, False, "reflect", False, True), [input, window], targets)
+    verify_trace_model(test_fn(3, 3, 3, True, "reflect", False, True), [input, window], targets)
+    verify_trace_model(test_fn(3, 3, 3, True, "reflect", True, True), [input, window], targets)
+    verify_trace_model(test_fn(3, 3, 3, True, "reflect", False, False), [input, window], targets)
+    input = torch.rand([2, 12]).float()
+    window = torch.tensor([2, 3, 4], dtype=torch.int32)
+    verify_trace_model(test_fn(3, 3, 3, False, "reflect", False, True), [input, window], targets)
+    window = torch.tensor([1, 3], dtype=torch.int32)
+    verify_trace_model(test_fn(2, 1, 2, False, "reflect", False, True), [input, window], targets)
+    verify_trace_model(test_fn(2, 1, 2, False, "reflect", False, True), [input], targets)
+
+
 @tvm.testing.uses_gpu
 def test_dot():
     def test_fn(x):
@@ -4166,22 +4177,44 @@ def test_mv():
 
 
 def test_grid_sample():
-    class Grid_sample_zeros(Module):
+    class Grid_sample(Module):
+        def __init__(self, method, padding_mode, align_corners):
+            super().__init__()
+            self._method = method
+            self._padding_mode = padding_mode
+            self._align_corners = align_corners
+
         def forward(self, x, y):
             return torch.nn.functional.grid_sample(
-                input=x, grid=y, mode="bilinear", padding_mode="zeros", align_corners=True
+                input=x,
+                grid=y,
+                mode=self._method,
+                padding_mode=self._padding_mode,
+                align_corners=self._align_corners,
             )
 
-    class Grid_sample_border(Module):
-        def forward(self, x, y):
-            return torch.nn.functional.grid_sample(
-                input=x, grid=y, mode="bilinear", padding_mode="border", align_corners=True
-            )
+    methods = ["nearest", "bilinear", "bicubic"]
+    padding_modes = ["zeros", "border", "reflection"]
+    align_corners = [True, False]
 
-    data = torch.rand([4, 4, 16, 32]).float()
-    grid = torch.rand([4, 8, 8, 2]).float()
-    verify_model(Grid_sample_zeros(), input_data=[data, grid])
-    verify_model(Grid_sample_border(), input_data=[data, grid])
+    data_2D = torch.rand([4, 4, 8, 8]).float()
+    grid_2D = torch.rand([4, 16, 16, 2]).float()
+    data_3D = torch.rand([4, 4, 8, 8, 8]).float()
+    grid_3D = torch.rand([4, 16, 16, 16, 3]).float()
+
+    for _method in methods:
+        for _padding in padding_modes:
+            for _align in align_corners:
+                # ATTENTION:
+                #   "nearest" + "reflection" result may be different with pytorch on cpu device,
+                #   because pytorch's cpu result is different with gpu result,
+                #   and gpu result used here as baseline in tvm topi.image.grid_sample.
+                model = Grid_sample(_method, _padding, _align)
+                verify_model(model, input_data=[data_2D, grid_2D])
+
+                # 3D "bicubic"(tricubic) is not supported in pytorch
+                if _method != "bicubic":
+                    verify_model(model, input_data=[data_3D, grid_3D])
 
 
 def test_list_tuple():
@@ -4203,6 +4236,52 @@ def test_list_tuple():
     x = torch.rand([4, 4, 16, 32]).float()
     script_module = torch.jit.trace(List_tuple(), x, strict=False).eval()
     relay.frontend.from_pytorch(script_module, [("x", x.shape)])
+
+
+@tvm.testing.uses_gpu
+def test_binary_bitwise():
+    def test_ior(x, y):
+        return x.__ior__(y)
+
+    def test_iand(x, y):
+        return x.__iand__(y)
+
+    def test_ixor(x, y):
+        return x.__ixor__(y)
+
+    x = torch.tensor([7, 49, 16, 1, 2, 3], dtype=torch.uint8)
+    y = torch.tensor([39, 128, 99, 228, 63, 17], dtype=torch.uint8)
+
+    for test_fn in [test_ior, test_iand, test_ixor]:
+        verify_model(test_fn, [x, y])
+
+
+@tvm.testing.uses_gpu
+def test_shift():
+    def test_lshift(x, y):
+        return x << y
+
+    def test_rshift(x, y):
+        return x >> y
+
+    x = torch.tensor([39, 128, 99, 228, 63, 17], dtype=torch.int32)
+    y = torch.tensor([3, 2, 7, 4, 5, 9], dtype=torch.int32)
+
+    for test_fn in [test_lshift, test_rshift]:
+        verify_model(test_fn, [x, y])
+
+
+@tvm.testing.uses_gpu
+def test_mod():
+    def test_fmod(x, y):
+        return torch.fmod(x, y)
+
+    def test_remainder(x, y):
+        return torch.remainder(x, y)
+
+    for test_fn in [test_fmod, test_remainder]:
+        verify_model(test_fn, [torch.tensor([-3.0, -2, -1, 1, 2, 3]), torch.tensor(2)])
+        verify_model(test_fn, [torch.tensor([1, 2, 3, 4, 5]), torch.tensor(-1.5)])
 
 
 if __name__ == "__main__":

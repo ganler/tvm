@@ -31,6 +31,7 @@ TuneContext::TuneContext(Optional<IRModule> mod,                                
                          Optional<Array<Postproc>> postprocs,                       //
                          Optional<Map<Mutator, FloatImm>> mutator_probs,            //
                          Optional<String> task_name,                                //
+                         PackedFunc logging_func,                                   //
                          support::LinearCongruentialEngine::TRandState rand_state,  //
                          int num_threads) {
   ObjectPtr<TuneContextNode> n = make_object<TuneContextNode>();
@@ -42,12 +43,10 @@ TuneContext::TuneContext(Optional<IRModule> mod,                                
   n->postprocs = postprocs.value_or({});
   n->mutator_probs = mutator_probs.value_or({});
   n->task_name = task_name;
-  if (rand_state == -1) {
-    rand_state = support::LinearCongruentialEngine::DeviceRandom();
-  }
+  n->logging_func = logging_func;
   support::LinearCongruentialEngine(&n->rand_state).Seed(rand_state);
   n->num_threads = num_threads;
-  n->is_stopped = false;
+  n->is_terminated = false;
   n->runner_futures = NullOpt;
   n->measure_candidates = NullOpt;
   data_ = std::move(n);
@@ -66,10 +65,8 @@ void TuneContextNode::Initialize() {
   for (const Postproc& postproc : postprocs) {
     postproc->InitializeWithTuneContext(GetRef<TuneContext>(this));
   }
-  if (mutator_probs.defined()) {
-    for (const auto& kv : mutator_probs) {
-      kv.first->InitializeWithTuneContext(GetRef<TuneContext>(this));
-    }
+  for (const auto& kv : mutator_probs) {
+    kv.first->InitializeWithTuneContext(GetRef<TuneContext>(this));
   }
 }
 
@@ -84,10 +81,14 @@ TVM_REGISTER_GLOBAL("meta_schedule.TuneContext")
                        Optional<Array<Postproc>> postprocs,                       //
                        Optional<Map<Mutator, FloatImm>> mutator_probs,            //
                        Optional<String> task_name,                                //
+                       PackedFunc logging_func,                                   //
                        support::LinearCongruentialEngine::TRandState rand_state,  //
                        int num_threads) -> TuneContext {
       return TuneContext(mod, target, space_generator, search_strategy, sch_rules, postprocs,
-                         mutator_probs, task_name, rand_state, num_threads);
+                         mutator_probs, task_name, logging_func, rand_state, num_threads);
     });
+
+TVM_REGISTER_GLOBAL("meta_schedule._SHash2Hex").set_body_typed(SHash2Hex);
+
 }  // namespace meta_schedule
 }  // namespace tvm

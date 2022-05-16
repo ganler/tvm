@@ -107,8 +107,8 @@ class TensorRTRuntime : public JSONRuntimeBase {
     ICHECK_EQ(consts.size(), const_idx_.size())
         << "The number of input constants must match the number of required.";
     LoadGlobalAttributes();
-    if (GetCachedEnginesFromDisk()) return;
     SetupConstants(consts);
+    GetCachedEnginesFromDisk();
   }
 
   void LoadGlobalAttributes() {
@@ -127,7 +127,9 @@ class TensorRTRuntime : public JSONRuntimeBase {
           max_workspace_size_ =
               std::stoul(nodes_[i].GetAttr<std::vector<std::string>>("max_workspace_size")[0]);
         }
-        return;
+      }
+      if (nodes_[i].HasAttr("use_fp16")) {
+        use_fp16_ = std::stoi(nodes_[i].GetAttr<std::vector<std::string>>("use_fp16")[0]);
       }
     }
   }
@@ -163,12 +165,14 @@ class TensorRTRuntime : public JSONRuntimeBase {
           const std::string name = nodes_[nid].GetOpName() + "_" + std::to_string(j);
           int binding_index = engine->getBindingIndex(name.c_str());
           ICHECK_NE(binding_index, -1);
+#if TRT_VERSION_GE(6, 0, 1)
           if (!use_implicit_batch_) {
             std::vector<int64_t> shape(data_entry_[eid]->shape,
                                        data_entry_[eid]->shape + data_entry_[eid]->ndim);
             auto dims = VectorToTrtDims(shape);
             ICHECK(context->setBindingDimensions(binding_index, dims));
           }
+#endif
           if (data_entry_[eid]->device.device_type == kDLCUDA) {
             bindings[binding_index] = data_entry_[eid]->data;
           } else {
@@ -298,8 +302,8 @@ class TensorRTRuntime : public JSONRuntimeBase {
       }
     }
 
-    LOG(INFO) << "Finished building TensorRT engine for subgraph " << symbol_name_
-              << " with batch size " << batch_size;
+    VLOG(1) << "Finished building TensorRT engine for subgraph " << symbol_name_
+            << " with batch size " << batch_size;
     CacheEngineToDisk();
     return trt_engine_cache_.at(std::make_pair(symbol_name_, batch_size));
   }
@@ -366,10 +370,11 @@ class TensorRTRuntime : public JSONRuntimeBase {
     std::istringstream is(serialized_meta);
     dmlc::JSONReader reader(&is);
     dmlc::JSONObjectReadHelper helper;
+    int batch_size;
     helper.DeclareField("inputs", &engine_and_context.inputs);
     helper.DeclareField("outputs", &engine_and_context.outputs);
+    helper.DeclareField("batch_size", &batch_size);
     helper.ReadAllFields(&reader);
-    const int batch_size = GetBatchSize();
     trt_engine_cache_[std::make_pair(symbol_name_, batch_size)] = engine_and_context;
     LOG(INFO) << "finished saving engine and context ... ";
     return true;
@@ -399,6 +404,7 @@ class TensorRTRuntime : public JSONRuntimeBase {
                                trt_engine_cache_[std::make_pair(symbol_name_, batch_size)].inputs);
     writer.WriteObjectKeyValue("outputs",
                                trt_engine_cache_[std::make_pair(symbol_name_, batch_size)].outputs);
+    writer.WriteObjectKeyValue("batch_size", batch_size);
     writer.EndObject();
     std::string meta_path = cache_dir + "/" + key + ".meta";
     SaveBinaryToFile(meta_path, os.str());

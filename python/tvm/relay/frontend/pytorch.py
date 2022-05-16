@@ -254,6 +254,20 @@ class PyTorchOpConverter:
     # Operator implementations
     def make_elemwise(self, name):
         def elemwise(inputs, input_types):
+            if name == "divide":
+                # https://pytorch.org/docs/stable/generated/torch.div.html#torch.div
+                # None - default behavior. Performs no rounding and, if both input and
+                # other are integer types, promotes the inputs to the default scalar type.
+                if all(["int" in input_type for input_type in input_types[:2]]):
+                    input_types[:2] = ["float32"] * 2
+                    cast_inputs = []
+                    for inp in inputs[:2]:
+                        if np.isscalar(inp):
+                            cast_inputs.append(_expr.const(inp, dtype="float32"))
+                        else:
+                            cast_inputs.append(_op.cast(inp, "float32"))
+                    inputs[:2] = cast_inputs
+
             data0, data1 = self.pytorch_promote_types(inputs[:2], input_types[:2])
             return get_relay_op(name)(data0, data1)
 
@@ -263,7 +277,7 @@ class PyTorchOpConverter:
         if len(inputs) == 1:
             data = self.pytorch_promote_types(inputs[:1], input_types[:1])
             return get_relay_op(name_reduce)(data[0])
-        elif len(inputs) >= 2 and isinstance(inputs[1], int):
+        elif len(inputs) >= 2 and isinstance(inputs[1], (list, int)):
             data = self.pytorch_promote_types(inputs[:1], input_types[:1])
             dim = inputs[1]
             keepdims = inputs[2] if len(inputs) > 2 else False
@@ -292,6 +306,10 @@ class PyTorchOpConverter:
         (dtype,) = input_types
         one = _expr.const(1, dtype=dtype)
         return _op.log(inputs[0] + one)
+
+    def square(self, inputs, input_types):
+        (dtype,) = input_types
+        return _op.power(inputs[0], _expr.const(2, dtype))
 
     def arange(self, inputs, input_types):
         def _get_value(val, dtype):
@@ -641,7 +659,7 @@ class PyTorchOpConverter:
                 tmp.append(_op.cast(_op.expand_dims(dim, axis=0), "int64"))
             size = _op.concatenate(tmp, axis=0)
 
-        out = _op.full(_expr.const(fill_value), size, dtype=dtype)
+        out = _op.full(_expr.const(fill_value, dtype=dtype), size, dtype=dtype)
         if need_reshape:
             out = _op.reshape(out, new_shape)
         return out
@@ -809,7 +827,7 @@ class PyTorchOpConverter:
         # with tanh and third order polynomials, but this is "true" gelu
         return data * (
             _expr.const(0.5, dtype=dtype)
-            + _op.erf(data * _expr.const(0.5 ** 0.5, dtype=dtype)) * _expr.const(0.5, dtype=dtype)
+            + _op.erf(data * _expr.const(0.5**0.5, dtype=dtype)) * _expr.const(0.5, dtype=dtype)
         )
 
     def selu(self, inputs, input_types):
@@ -1234,8 +1252,11 @@ class PyTorchOpConverter:
         end = int(inputs[2])
         dshape = get_const_tuple(self.infer_shape_with_prelude(data))
         ndim = len(dshape)
+        if start < 0:
+            start += ndim
         if end < 0:
             end += ndim
+        assert start <= end, "start dim cannot come after end dim"
         new_shape = [0] * start
 
         new_shape.append(-1)
@@ -2018,6 +2039,14 @@ class PyTorchOpConverter:
             assert isinstance(ty, tvm.ir.TypeCall) and ty.func == list_ty, msg
             return self.tensor_array_stack(inputs, input_types)
 
+    def sub(self, inputs, input_types):
+        if len(inputs) == 3:
+            data0, data1, alpha = self.pytorch_promote_types(inputs, input_types)
+            return get_relay_op("subtract")(data0, alpha * data1)
+        else:
+            data0, data1 = self.pytorch_promote_types(inputs, input_types)
+            return get_relay_op("subtract")(data0, data1)
+
     def rsub(self, inputs, input_types):
         data0, data1, alpha = self.pytorch_promote_types(inputs, input_types)
 
@@ -2158,6 +2187,17 @@ class PyTorchOpConverter:
         )
 
         return _op.nn.bias_add(conv_out, bias)
+
+    def stft(self, inputs, input_types):
+        data = inputs[0]
+        n_fft = inputs[1]
+        hop_length = inputs[2]
+        win_length = inputs[3]
+        window = inputs[4]
+        normalized = inputs[5]
+        onesided = inputs[6]
+
+        return _op.stft(data, n_fft, hop_length, win_length, window, normalized, onesided)
 
     def unbind(self, inputs, input_types):
         data = inputs[0]
@@ -2838,7 +2878,10 @@ class PyTorchOpConverter:
             inp = inputs[0]
         return op(inp, axis=dim, keepdims=keepdim)
 
-    def searchsorted_common(self, sorted_sequence, values, out_int32, right):
+    def searchsorted_common(
+        self, sorted_sequence, values, out_int32, right, side=None, out=None, sorter=None
+    ):
+        assert side is None and out is None and sorter is None, "unsupported parameters"
         dtype = "int32" if out_int32 else "int64"
         values_shape = _infer_shape(values)
 
@@ -2913,23 +2956,46 @@ class PyTorchOpConverter:
         return _op.transform.squeeze(dense_result)
 
     def grid_sampler(self, inputs, input_types):
-        if inputs[2] == 0:
-            mode = "bilinear"
-        else:
-            msg = "Only bilinear mode is supported in grid_sampler"
-            raise NotImplementedError(msg)
+        interpolate_mode = inputs[2]
+        padding_mode = inputs[3]
+        align_corners = inputs[4]
+        data_shape = self.infer_shape_with_prelude(inputs[0])
 
-        if inputs[3] == 0:
-            padding_mode = "zeros"
-        elif inputs[3] == 1:
-            padding_mode = "border"
+        if len(data_shape) == 4:
+            layout = "NCHW"
+            axes = [0, 3, 1, 2]
+            grid = _op.transform.transpose(inputs[1], axes)
+        elif len(data_shape) == 5:
+            layout = "NCDHW"
+            axes = [0, 4, 1, 2, 3]
+            grid = _op.transform.transpose(inputs[1], axes)
         else:
-            msg = "Only zeros and border padding mode are supported in grid_sampler"
-            raise NotImplementedError(msg)
+            msg = f"only 4D and 5D are supported."
+            raise ValueError(msg)
 
-        axes = [0, 3, 1, 2]
-        grid = _op.transform.transpose(inputs[1], axes)
-        return _op.image.grid_sample(inputs[0], grid, mode, "NCHW", padding_mode)
+        if interpolate_mode == 0:
+            interpolate_str = "bilinear"
+        elif interpolate_mode == 1:
+            interpolate_str = "nearest"
+        elif interpolate_mode == 2:
+            interpolate_str = "bicubic"
+        else:
+            msg = f"interpolation method {interpolate_mode} is not supported"
+            raise ValueError(msg)
+
+        if padding_mode == 0:
+            padding_mode_str = "zeros"
+        elif padding_mode == 1:
+            padding_mode_str = "border"
+        elif padding_mode == 2:
+            padding_mode_str = "reflection"
+        else:
+            msg = f"padding_mode {padding_mode} is not supported"
+            raise ValueError(msg)
+
+        return _op.image.grid_sample(
+            inputs[0], grid, interpolate_str, layout, padding_mode_str, align_corners
+        )
 
     # Operator mappings
     def create_convert_map(self):
@@ -2938,9 +3004,12 @@ class PyTorchOpConverter:
             "aten::pixel_shuffle": self.pixel_shuffle,
             "aten::device": self.none,
             "prim::device": self.none,
-            "aten::sub": self.make_elemwise("subtract"),
+            "aten::sub": self.sub,
             "aten::max": self.max,
             "aten::min": self.min,
+            "aten::amax": self.max,
+            "aten::amin": self.min,
+            "aten::stft": self.stft,
             "aten::mul": self.make_elemwise("multiply"),
             "aten::pow": self.make_elemwise("power"),
             "aten::arange": self.arange,
@@ -2948,6 +3017,8 @@ class PyTorchOpConverter:
             "aten::div": self.make_elemwise("divide"),
             "aten::floor_divide": self.make_elemwise("floor_divide"),
             "aten::true_divide": self.make_elemwise("divide"),
+            "aten::fmod": self.make_elemwise("trunc_mod"),
+            "aten::remainder": self.make_elemwise("floor_mod"),
             "aten::addcdiv": self.addcdiv,
             "aten::addcmul": self.addcmul,
             "aten::ones": self.ones,
@@ -3077,6 +3148,7 @@ class PyTorchOpConverter:
             "aten::sign": self.make_unary("sign"),
             "aten::sqrt": self.make_unary("sqrt"),
             "aten::rsqrt": self.make_unary("rsqrt"),
+            "aten::square": self.square,
             "aten::ceil": self.make_unary("ceil"),
             "aten::floor": self.make_unary("floor"),
             "aten::round": self.make_unary("round"),
@@ -3161,6 +3233,11 @@ class PyTorchOpConverter:
             "aten::dot": self.dot,
             "aten::mv": self.mv,
             "aten::grid_sampler": self.grid_sampler,
+            "aten::__ior__": self.make_elemwise("bitwise_or"),
+            "aten::__iand__": self.make_elemwise("bitwise_and"),
+            "aten::__ixor__": self.make_elemwise("bitwise_xor"),
+            "aten::__lshift__": self.make_elemwise("left_shift"),
+            "aten::__rshift__": self.make_elemwise("right_shift"),
         }
 
     def update_convert_map(self, custom_map):
@@ -3458,6 +3535,7 @@ def _pytorch_result_type(dtypes, non_tensor_inputs):
 def _convert_dtype_value(val):
     """converts a PyTorch the PyTorch numeric type id to a torch scalar type."""
     convert_torch_dtype_map = {
+        11: "torch.bool",
         7: "torch.float64",
         6: "torch.float32",
         5: "torch.float16",

@@ -146,6 +146,15 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 // IterVar
 IterVar::IterVar(Range dom, Var var, IterVarType t, String thread_tag, Span span) {
   ObjectPtr<IterVarNode> n = make_object<IterVarNode>();
+  if (dom.defined() && dom->extent.defined()) {
+    CHECK(dom->extent.dtype().is_int())
+        << "The dtype of the domain of an IterVar must be an integer type. However, the domain's "
+           "dtype is "
+        << dom->extent.dtype();
+    CHECK_EQ(dom->extent.dtype(), var.dtype())
+        << "The dtype of the extent of an IterVar (" << dom->extent.dtype()
+        << ") must match its associated Var's dtype (" << var.dtype() << ")";
+  }
   n->dom = dom;
   n->var = var;
   n->iter_type = t;
@@ -801,7 +810,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 // Call
 Call::Call(DataType dtype, RelayExpr op, Array<PrimExpr> args, Span span) {
   for (size_t i = 0; i < args.size(); ++i) {
-    ICHECK(args[i].defined());
+    ICHECK(args[i].defined()) << "arg " << i << " is not defined()";
   }
 
   ObjectPtr<CallNode> node = make_object<CallNode>();

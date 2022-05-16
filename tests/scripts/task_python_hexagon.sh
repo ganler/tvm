@@ -18,10 +18,37 @@
 
 set -e
 set -u
-set -x
+
+device_serial="simulator"
+if [ $# -ge 1 ] && [[ "$1" = "--device" ]]; then
+    shift 1
+    device_serial="$1"
+    shift
+fi
 
 source tests/scripts/setup-pytest-env.sh
-
 make cython3
 
+if [[ "${device_serial}" == "simulator" ]]; then
+    export TVM_TRACKER_PORT=9190
+    export TVM_TRACKER_HOST=0.0.0.0
+    env PYTHONPATH=python python3 -m tvm.exec.rpc_tracker --host "${TVM_TRACKER_HOST}" --port "${TVM_TRACKER_PORT}" &
+    TRACKER_PID=$!
+    sleep 5   # Wait for tracker to bind
+
+    # Temporary workaround for symbol visibility
+    export HEXAGON_SHARED_LINK_FLAGS="-Lbuild/hexagon_api_output -lhexagon_rpc_sim"
+
+    # HEXAGON_TOOLCHAIN is already set
+    export HEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH}
+fi
+
+# should be removed after Hexagon Docker update
+export HEXAGON_GTEST="${HEXAGON_SDK_PATH}/utils/googletest/gtest"
+
+export ANDROID_SERIAL_NUMBER=${device_serial}
 run_pytest ctypes python-contrib-hexagon tests/python/contrib/test_hexagon
+
+if [[ "${device_serial}" == "simulator" ]]; then
+    kill ${TRACKER_PID}
+fi

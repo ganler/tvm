@@ -174,6 +174,16 @@ class SerialActivation(SerializableFormat):
         self.clip_max = clip_max
 
 
+class SerialBlockConfig(SerializableFormat):
+    """Specialization class to retrieve arguments of a BlockConfig
+    (similar to NpuBlockConfig of Vela) on a predefined ordering"""
+
+    def __init__(self, height: int, width: int, depth: int):
+        self.height = height
+        self.width = width
+        self.depth = depth
+
+
 class Serial2DConvolution(SerializableFormat):
     """Specialization class to retrieve arguments of
     a ethosu.conv2d tir extern call on a predefined ordering"""
@@ -184,23 +194,29 @@ class Serial2DConvolution(SerializableFormat):
         ofm: SerialFeatureMap,
         kernel: SerialKernel,
         weight: SerialAddressRange,
+        weight2: SerialAddressRange,
         weight_zero_point: int,
         scale_bias: SerialAddressRange,
+        scale_bias2: SerialAddressRange,
         padding: SerialPadding,
         activation: SerialActivation,
         rounding_mode: str,
         upscale: str,
+        block_config: SerialBlockConfig,
     ):
         self.ifm = ifm
         self.ofm = ofm
         self.kernel = kernel
         self.weight = weight
+        self.weight2 = weight2
         self.weight_zero_point = weight_zero_point
         self.scale_bias = scale_bias
+        self.scale_bias2 = scale_bias2
         self.padding = padding
         self.activation = activation
         self.rounding_mode = rounding_mode
         self.upscale = upscale
+        self.block_config = block_config
 
 
 class Serial2DDepthwise(SerializableFormat):
@@ -219,6 +235,7 @@ class Serial2DDepthwise(SerializableFormat):
         activation: SerialActivation,
         rounding_mode: str,
         upscale: str,
+        block_config: SerialBlockConfig,
     ):
         self.ifm = ifm
         self.ofm = ofm
@@ -230,6 +247,7 @@ class Serial2DDepthwise(SerializableFormat):
         self.activation = activation
         self.rounding_mode = rounding_mode
         self.upscale = upscale
+        self.block_config = block_config
 
 
 class SerialCopy(SerializableFormat):
@@ -261,6 +279,7 @@ class SerialPooling(SerializableFormat):
         activation: SerialActivation,
         rounding_mode: str,
         upscale: str,
+        block_config: SerialBlockConfig,
     ):
         self.ifm = ifm
         self.ofm = ofm
@@ -270,6 +289,7 @@ class SerialPooling(SerializableFormat):
         self.activation = activation
         self.rounding_mode = rounding_mode
         self.upscale = upscale
+        self.block_config = block_config
 
 
 class SerialBinaryElementwise(SerializableFormat):
@@ -285,6 +305,7 @@ class SerialBinaryElementwise(SerializableFormat):
         reversed_operands: bool,
         activation: SerialActivation,
         rounding_mode: str,
+        block_config: SerialBlockConfig,
     ):
         self.ifm = ifm
         self.ifm2 = ifm2
@@ -293,6 +314,7 @@ class SerialBinaryElementwise(SerializableFormat):
         self.reversed_operands = reversed_operands
         self.activation = activation
         self.rounding_mode = rounding_mode
+        self.block_config = block_config
 
 
 class SerialUnaryElementwise(SerializableFormat):
@@ -306,9 +328,11 @@ class SerialUnaryElementwise(SerializableFormat):
         operator_type: str,
         activation: SerialActivation,
         rounding_mode: str,
+        block_config: SerialBlockConfig,
     ):
         self.ifm = ifm
         self.ofm = ofm
         self.operator_type = operator_type
         self.activation = activation
         self.rounding_mode = rounding_mode
+        self.block_config = block_config

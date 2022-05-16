@@ -30,8 +30,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="List pytest nodeids for a folder")
     parser.add_argument("--sccache-bucket", required=False, help="sccache bucket name")
-    parser.add_argument("--num-executors", required=True, help="number of Jenkins executors")
     parser.add_argument("--build-dir", default="build", help="build folder")
+    parser.add_argument("--cmake-target", help="optional build target")
     args = parser.parse_args()
 
     env = {"VTA_HW_PATH": str(Path(os.getcwd()) / "3rdparty" / "vta-hw")}
@@ -63,14 +63,23 @@ if __name__ == "__main__":
         logging.info("===== sccache stats =====")
         sh.run("sccache --show-stats")
 
-    executors = int(args.num_executors)
+    executors = int(os.environ.get("CI_NUM_EXECUTORS", 1))
+
     nproc = multiprocessing.cpu_count()
 
     available_cpus = nproc // executors
     num_cpus = max(available_cpus, 1)
 
-    sh.run("cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo ..", cwd=build_dir)
-    sh.run(f"cmake --build . -- VERBOSE=1 -j{num_cpus}", cwd=build_dir)
+    sh.run("cmake -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo ..", cwd=build_dir)
+    target = ""
+    if args.cmake_target:
+        target = args.cmake_target
+
+    verbose = os.environ.get("VERBOSE", "true").lower() in {"1", "true", "yes"}
+    ninja_args = [target, f"-j{num_cpus}"]
+    if verbose:
+        ninja_args.append("-v")
+    sh.run(f"cmake --build . -- " + " ".join(ninja_args), cwd=build_dir)
 
     if use_sccache:
         logging.info("===== sccache stats =====")

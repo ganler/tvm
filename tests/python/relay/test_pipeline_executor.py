@@ -17,12 +17,15 @@
 
 import pytest
 import os
+import time
 import numpy as np
 import tvm
 import tvm.testing
 from tvm import relay
 from tvm.relay import transform
-from tvm.contrib import graph_executor, pipeline_executor
+from tvm.contrib import graph_executor, pipeline_executor, pipeline_executor_build
+from tvm._ffi import get_global_func
+from tvm.contrib import cc as _cc
 
 
 def get_mannual_mod():
@@ -78,6 +81,7 @@ def get_manual_conf(mods, target):
     # is for mod2 input.
     pipe_config1 = {
         "mod_idx": 0,
+        "cpu_affinity": "0",
         "output": [
             {"output_idx": 0, "dependencies": [{"mod_idx": 1, "input_name": "data_0"}]},
             {"output_idx": 1, "dependencies": [{"mod_idx": 2, "input_name": "data_0"}]},
@@ -91,11 +95,13 @@ def get_manual_conf(mods, target):
         "build": None,
         "params": None,
         "target": target[0],
+        "fcompile": _cc.create_shared,
         "dev": target[1],
     }
 
     pipe_config2 = {
         "mod_idx": 1,
+        "cpu_affinity": "0",
         "output": [
             {"output_idx": 0, "dependencies": [{"mod_idx": 2, "input_name": "data_1"}]},
         ],
@@ -107,11 +113,13 @@ def get_manual_conf(mods, target):
         "build": None,
         "params": None,
         "target": "llvm",
+        "fcompile": None,
         "dev": tvm.cpu(0),
     }
 
     pipe_config3 = {
         "mod_idx": 2,
+        "cpu_affinity": "0",
         "output": [{"output_idx": 0, "dependencies": [{"global_output_index": 1}]}],
     }
     mod_config[mods[2]] = {
@@ -121,6 +129,7 @@ def get_manual_conf(mods, target):
         "build": None,
         "params": None,
         "target": "llvm",
+        "fcompile": None,
         "dev": tvm.cpu(0),
     }
     return mod_config
@@ -202,14 +211,21 @@ def run_modules(
     return final_output
 
 
+def reset_cpu_affinity(affinity):
+    # Restore the CPU affinity into the default value.
+    config_threadpool = get_global_func("runtime.config_threadpool")
+    config_threadpool(-2, 0)
+    os.sched_setaffinity(0, affinity)
+
+
 def test_pipe_runtime_error_check():
     # This function is used to trigger runtime error by applying wrong logic.
-    if pipeline_executor.pipeline_executor_enabled():
+    if pipeline_executor_build.pipeline_executor_build_enabled():
         # Get three pipeline modules here.
         (mod1, mod2, mod3), dshape = get_mannual_mod()
 
         # The input or output name is illegal and expects a runtime error.
-        pipe_error = pipeline_executor.PipelineConfig()
+        pipe_error = pipeline_executor_build.PipelineConfig()
         with pytest.raises(RuntimeError):
             pipe_error[mod1]["output"][9]
 
@@ -242,14 +258,14 @@ def test_pipe_runtime_error_check():
             pipe_error["output"]["0"].connect(pipe_error[mod1]["output"][0])
 
         # Create pipeline executor to check the executor runtime errors.
-        pipe_config = pipeline_executor.PipelineConfig()
+        pipe_config = pipeline_executor_build.PipelineConfig()
         pipe_config[mod1].target = "llvm"
         pipe_config[mod1].dev = tvm.cpu(0)
         pipe_config["param_group"]["param_0"].connect(pipe_config[mod1]["param"])
         pipe_config[mod1]["output"][0].connect(pipe_config["output"]["0"])
         # Build and create a pipeline module.
         with tvm.transform.PassContext(opt_level=3):
-            pipeline_mod_factory = pipeline_executor.build(pipe_config)
+            pipeline_mod_factory = pipeline_executor_build.build(pipe_config)
         pipeline_module = pipeline_executor.PipelineModule(pipeline_mod_factory)
         customized_parameters, _ = recreate_parameters(mod1)
 
@@ -262,9 +278,10 @@ def test_pipe_runtime_error_check():
 
 
 def test_pipeline():
-    if pipeline_executor.pipeline_executor_enabled():
+    if pipeline_executor_build.pipeline_executor_build_enabled():
         target_list = tvm.testing.enabled_targets()
         for target in target_list:
+            affinity = os.sched_getaffinity(0)
             # Get the three pipeline modules here.
             (mod1, mod2, mod3), dshape = get_mannual_mod()
 
@@ -273,7 +290,7 @@ def test_pipeline():
             for i in range(5):
                 datas.append(np.full(dshape, 3 + i).astype("float32"))
 
-            pipe_config = pipeline_executor.PipelineConfig()
+            pipe_config = pipeline_executor_build.PipelineConfig()
 
             customized_parameters, customized_parameters_mod = recreate_parameters(mod1)
             assert customized_parameters_mod == mod1
@@ -319,19 +336,23 @@ def test_pipeline():
             # Set other parameters.
             pipe_config[mod1].target = target[0]
             pipe_config[mod1].dev = target[1]
+            pipe_config[mod1].cpu_affinity = "0"
+            pipe_config[mod1].fcompile = _cc.create_shared
 
             pipe_config[mod2].target = "llvm"
             pipe_config[mod2].dev = tvm.cpu(0)
+            pipe_config[mod2].cpu_affinity = "0"
 
             pipe_config[mod3].target = "llvm"
             pipe_config[mod3].dev = tvm.cpu(0)
+            pipe_config[mod3].cpu_affinity = "0"
             # Checking the configuration of modules dependency.
             mconfig = pipe_config.get_config()
             assert mconfig["module_connection"] == get_manual_conf([mod1, mod2, mod3], target)
 
             # Build and create a pipeline module.
             with tvm.transform.PassContext(opt_level=3):
-                pipeline_mod_factory = pipeline_executor.build(pipe_config)
+                pipeline_mod_factory = pipeline_executor_build.build(pipe_config)
 
             # Export the parameter configuration to a file.
             directory_path = tvm.contrib.utils.tempdir().temp_dir
@@ -356,7 +377,9 @@ def test_pipeline():
             assert module_index == 0
             # Using the parameters group name to set parameters.
             pipeline_module_test.set_params("param_0", customized_parameters)
-            for data in datas:
+            normal_outputs = []
+            for round in range(0, len(datas)):
+                data = datas[round]
                 # Getting the result without setting customized parameters.
                 wrong_output = run_modules(
                     mconfig["module_connection"],
@@ -381,27 +404,40 @@ def test_pipeline():
                     customized_parameters_mod,
                     customized_parameters,
                 )
-                pipeline_module_test.set_input("data_a", data)
-                pipeline_module_test.set_input("data_b", data)
-                input_data = pipeline_module_test.get_input("data_a")
-                tvm.testing.assert_allclose(data, input_data.numpy())
-                # Running the pipeline executor in sequential mode.
-                pipeline_module_test.run(True)
-                outputs = pipeline_module_test.get_output()
-                for i in range(len(outputs)):
-                    tvm.testing.assert_allclose(normal_output[i], outputs[i].numpy())
-                    assert not (normal_output[i] == wrong_output[i]).all()
+                # Appending the normal output into the list in order to do future correctness
+                # checking.
+                normal_outputs.append(normal_output)
+                # Setting the input data into the pipeline executor.
+                pipeline_module_test.set_input("data_a", tvm.nd.array(data))
+                pipeline_module_test.set_input("data_b", tvm.nd.array(data))
+                input_map = pipeline_module_test.get_input_pipeline_map("data_a")
+                # Checking whether the input setting of the first runtime is successful.
+                # The input of the rest of runtime will go into a queue and we can not check
+                # these input data here.
+                if input_map[0] == "0":
+                    input_data = pipeline_module_test.get_input("data_a")
+                    tvm.testing.assert_allclose(data, input_data.numpy())
                 # Running the pipeline executor in the pipeline mode.
-                pipeline_module_test.run(False)
+                pipeline_module_test.run()
 
-            # TODO(huajsj:) Replacing the checking logic with getting output logic.
-            # Checking the statistic value of pipeline.
-            statistic_time = 0
-            while pipeline_module_test.num_executing_pipeline < len(datas):
-                statistic_time = statistic_time + 1
-                # Setting the timeout to 10 seconds.
-                assert statistic_time < 10
-                time.sleep(1)
+            for k in range(0, len(datas)):
+                statistic_time = 0
+                outputs = pipeline_module_test.get_output()
+                while len(outputs) == 0:
+                    outputs = pipeline_module_test.get_output()
+                    statistic_time = statistic_time + 1
+                    # Setting the timeout to 10 seconds.
+                    assert statistic_time < 5
+                    time.sleep(1)
+
+                for i in range(len(outputs)):
+                    tvm.testing.assert_allclose(normal_outputs[k][i], outputs[i].numpy())
+                    assert not (normal_output[i] == wrong_output[i]).all()
+
+                    assert pipeline_module_test.num_executing_pipeline == round + 1
+
+            # Reset the cpu affinity after a test.
+            reset_cpu_affinity(affinity)
 
 
 if __name__ == "__main__":

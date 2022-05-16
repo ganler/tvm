@@ -182,11 +182,12 @@ void ConcreteScheduleNode::Copy(ScheduleState* new_state, TSymbolTable* new_symb
   new_state->get()->DebugVerify();
 }
 
-Schedule ConcreteScheduleNode::Copy() const {
+Schedule ConcreteScheduleNode::Copy() {
   ObjectPtr<ConcreteScheduleNode> n = make_object<ConcreteScheduleNode>();
   n->error_render_level_ = this->error_render_level_;
   ConcreteScheduleNode::Copy(&n->state_, &n->symbol_table_);
   n->analyzer_ = std::make_unique<arith::Analyzer>();  // new analyzer needed because it is stateful
+  n->rand_state_ = ForkSeed();
   return Schedule(std::move(n));
 }
 
@@ -213,9 +214,6 @@ Schedule ConcreteScheduleNode::Copy() const {
 /******** Schedule: Schedule: Sampling ********/
 
 void ConcreteScheduleNode::Seed(support::LinearCongruentialEngine::TRandState seed) {
-  if (seed == -1) {
-    seed = std::random_device()();
-  }
   support::LinearCongruentialEngine(&rand_state_).Seed(seed);
 }
 
@@ -683,6 +681,26 @@ void ConcreteScheduleNode::Unannotate(const BlockRV& block_rv, const String& ann
   tir::Unannotate(state_, this->GetSRef(block_rv), ann_key);
   this->state_->DebugVerify();
   TVM_TIR_SCHEDULE_END("unannotate", this->error_render_level_);
+}
+
+/******** Schedule: Layout transformation ********/
+void ConcreteScheduleNode::TransformLayout(const BlockRV& block_rv, int buffer_index,
+                                           BufferIndexType buffer_index_type,
+                                           const IndexMap& index_map) {
+  TVM_TIR_SCHEDULE_BEGIN();
+  tir::TransformLayout(state_, this->GetSRef(block_rv), buffer_index, buffer_index_type, index_map);
+  this->state_->DebugVerify();
+  TVM_TIR_SCHEDULE_END("transform_layout", this->error_render_level_);
+}
+
+void ConcreteScheduleNode::SetAxisSeparator(const BlockRV& block_rv, int buffer_index,
+                                            BufferIndexType buffer_index_type,
+                                            const Array<IntImm>& axis_separators) {
+  TVM_TIR_SCHEDULE_BEGIN();
+  tir::SetAxisSeparator(state_, this->GetSRef(block_rv), buffer_index, buffer_index_type,
+                        axis_separators);
+  TVM_TIR_SCHEDULE_END("set-axis-separator", this->error_render_level_);
+  this->state_->DebugVerify();
 }
 
 /******** Schedule: Misc ********/

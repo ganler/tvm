@@ -31,6 +31,8 @@
 #include <tvm/runtime/object.h>
 #include <tvm/tir/var.h>
 
+#include <utility>
+
 namespace tvm {
 namespace tir {
 
@@ -106,10 +108,18 @@ class IndexMapNode : public Object {
    */
   Array<PrimExpr> MapShape(const Array<PrimExpr>& shape) const;
 
+  /*!
+   * \brief Convert to string representation in Python.
+   * \return The stringified lambda expression in Python.
+   */
+  String ToPythonString() const;
+
   void VisitAttrs(AttrVisitor* v) {
     v->Visit("initial_indices", &initial_indices);
     v->Visit("final_indices", &final_indices);
   }
+
+  static constexpr const char* _type_key = "tir.IndexMap";
 
   TVM_DECLARE_FINAL_OBJECT_INFO(IndexMapNode, Object);
 };
@@ -118,6 +128,14 @@ class IndexMap : public ObjectRef {
  public:
   IndexMap(Array<Var> initial_indices, Array<PrimExpr> final_indices);
 
+  /*!
+   * \brief Create an index map from a packed function
+   * \param ndim The number of dimensions
+   * \param func The function to be applied
+   * \return The created index map
+   */
+  static IndexMap FromFunc(int ndim, runtime::TypedPackedFunc<Array<PrimExpr>(Array<Var>)> func);
+
   /*! \brief Generate the inverse mapping.
    *
    * The range of the input indices is required in order to ensure
@@ -125,11 +143,23 @@ class IndexMap : public ObjectRef {
    *
    * TODO(Lunderberg): Look into allowing non-bijective
    * transformations.  If injective, the inverse mapping could still
-   * be generated with some predicate.  If non-injective, could
-   * simplify the implementation of other optimizations (e.g. double
-   * buffering as a map `lambda *indices: [buffer_loop%2, *indices]`).
+   * be generated with some predicate (see NonSurjectiveInverse).  If
+   * non-injective, could simplify the implementation of other
+   * optimizations (e.g. double buffering as a map `lambda *indices:
+   * [buffer_loop%2, *indices]`).
    */
   IndexMap Inverse(Array<Range> initial_ranges) const;
+
+  /*! \brief Generate the inverse mapping.
+   *
+   * Determine the inverse, where the output range may contain
+   * addresses that do not correspond to an address in the input
+   * range.
+   *
+   * \return The inverted index map, along with the predicate for
+   * which the inverse maps to a valid range.
+   */
+  std::pair<IndexMap, PrimExpr> NonSurjectiveInverse(Array<Range> initial_ranges) const;
 
   TVM_DEFINE_OBJECT_REF_METHODS(IndexMap, ObjectRef, IndexMapNode);
 };

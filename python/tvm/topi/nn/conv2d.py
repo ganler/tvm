@@ -486,7 +486,6 @@ def conv2d_NCHWc_int8(
     oc_chunk, ic_chunk_group, kernel_height, kernel_width, _, oc_bn, _ = get_const_tuple(
         kernel.shape
     )
-    num_filter = oc_chunk * oc_bn
     groups = ic_chunk // ic_chunk_group
 
     dilated_kernel_h = (kernel_height - 1) * dilation_h + 1
@@ -537,6 +536,7 @@ def conv2d_NCHWc_int8(
             ),
             name="conv2d_NCHWc_int8",
             tag="conv2d_NCHWc_int8",
+            attrs={"schedule_rule": "meta_schedule.conv2d_NCHWc_int8"},
         )
     # for int8 group conv support
     ic_chunk = in_channel // ic_bn
@@ -559,6 +559,7 @@ def conv2d_NCHWc_int8(
         ),
         name="conv2d_NCHWc_int8",
         tag="conv2d_NCHWc_int8",
+        attrs={"schedule_rule": "meta_schedule.conv2d_NCHWc_int8"},
     )
 
 

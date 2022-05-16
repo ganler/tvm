@@ -38,6 +38,35 @@ namespace tir {
 // These information are needed during codegen.
 class BuiltinLower : public StmtExprMutator {
  public:
+  // NOTE: Right now, we make the following scoping requirement
+  // for memory allocated by the following primitives
+  // - tvm_stack_make_array
+  // - tvm_stack_make_shape
+  // - arg stack
+  //
+  // Scoping and liveness rules:
+  // - Every call_packed introduce a new scope.
+  // - The memory allocated by tvm_stack_make_array/make_shape will
+  //   no longer become valid outside the scope (and may be reused by
+  //   subsequent call_packed.
+  // - TODO(tvm-team): we might consider a root scope so stack_make_shape
+  //   can be called out-side call_packed.
+  //
+  //  Example:
+  //  {
+  //    call_packed(make_shape1(...),
+  //                call_packed(make_shape2(...))
+  //    call_packed(make_shape3(...))
+  //  }
+  //
+  //  In this case, make_shape1 and make_shape2 should not share memory,
+  //  but they can share memory with make_shape3.
+  //
+  //  Rationale: most of the packed calls needs their own internal
+  //  argument stack, and those stack can be shared across calls.
+  //  Scoping is a quick way to enable sharing without having
+  //  to do full-scale liveness analysis and it does its job.
+  //  Alternative approaches can also be used.
   struct StackSizes {
     // If a tvm_stack_make_shape call has no arguments, it is still
     // valid and represents a scalar shape ().  Therefore, -1 is used
@@ -80,11 +109,14 @@ class BuiltinLower : public StmtExprMutator {
     precheck.device_type_ = this->device_type_;
 
     precheck.alloca_scope_.emplace_back();
-    auto& scope = precheck.alloca_scope_.back();
-    scope.stack_shape =
-        decl_buffer({IntImm(DataType::Int(64), 0)}, DataType::Int(64), "stack_shape");
-    scope.stack_tcode =
-        decl_buffer({IntImm(DataType::UInt(64), 0)}, DataType::Int(32), "stack_tcode");
+    {
+      // NOTE: this scope reference is invalid after any mutation is applied to alloca_scope_.
+      auto& scope = precheck.alloca_scope_.back();
+      scope.stack_shape =
+          decl_buffer({IntImm(DataType::Int(64), 0)}, DataType::Int(64), "stack_shape");
+      scope.stack_tcode =
+          decl_buffer({IntImm(DataType::UInt(64), 0)}, DataType::Int(32), "stack_tcode");
+    }
 
     precheck.VisitStmt(stmt);
 
@@ -101,31 +133,35 @@ class BuiltinLower : public StmtExprMutator {
     }
 
     alloca_scope_.emplace_back();
-    auto& scope = alloca_scope_.back();
+    {
+      // NOTE: this scope reference is invalid after any mutation is applied to alloca_scope_.
+      auto& scope = alloca_scope_.back();
 
-    // Initial check to identify maximum stack sizes.  These are used
-    // to construct Buffer objects to hold the stack, which are then
-    // used when mutating.
-    scope.max_sizes = GetMaxStack(stmt);
+      // Initial check to identify maximum stack sizes.  These are used
+      // to construct Buffer objects to hold the stack, which are then
+      // used when mutating.
+      scope.max_sizes = GetMaxStack(stmt);
 
-    if (scope.max_sizes.shape_stack != -1) {
-      scope.stack_shape = decl_buffer({IntImm(DataType::Int(64), scope.max_sizes.shape_stack)},
-                                      DataType::Int(64), "stack_shape");
-      stmt =
-          LetStmt(scope.stack_shape->data, StackAlloca("shape", scope.max_sizes.shape_stack), stmt);
-    }
+      if (scope.max_sizes.shape_stack != -1) {
+        scope.stack_shape = decl_buffer({IntImm(DataType::Int(64), scope.max_sizes.shape_stack)},
+                                        DataType::Int(64), "stack_shape");
+        stmt = LetStmt(scope.stack_shape->data, StackAlloca("shape", scope.max_sizes.shape_stack),
+                       stmt);
+      }
 
-    if (scope.max_sizes.array_stack != 0) {
-      stmt = LetStmt(scope.stack_array, StackAlloca("array", scope.max_sizes.array_stack), stmt);
-    }
+      if (scope.max_sizes.array_stack != 0) {
+        stmt = LetStmt(scope.stack_array, StackAlloca("array", scope.max_sizes.array_stack), stmt);
+      }
 
-    if (scope.max_sizes.arg_stack != 0) {
-      scope.stack_tcode = decl_buffer({IntImm(DataType::UInt(64), scope.max_sizes.arg_stack)},
-                                      DataType::Int(32), "stack_tcode");
-      stmt = LetStmt(scope.stack_value, StackAlloca("arg_value", scope.max_sizes.arg_stack), stmt);
+      if (scope.max_sizes.arg_stack != 0) {
+        scope.stack_tcode = decl_buffer({IntImm(DataType::UInt(64), scope.max_sizes.arg_stack)},
+                                        DataType::Int(32), "stack_tcode");
+        stmt =
+            LetStmt(scope.stack_value, StackAlloca("arg_value", scope.max_sizes.arg_stack), stmt);
 
-      stmt = LetStmt(scope.stack_tcode->data, StackAlloca("arg_tcode", scope.max_sizes.arg_stack),
-                     stmt);
+        stmt = LetStmt(scope.stack_tcode->data, StackAlloca("arg_tcode", scope.max_sizes.arg_stack),
+                       stmt);
+      }
     }
 
     stmt = this->VisitStmt(stmt);
@@ -140,10 +176,22 @@ class BuiltinLower : public StmtExprMutator {
     // allocate space to hold prepare stmts before s
     prep_seq_stack_.emplace_back(std::vector<Stmt>());
 
+    auto scope_size = alloca_scope_.size();
     auto stmt = StmtExprMutator::VisitStmt(s);
-    auto& scope = alloca_scope_.back();
-    ICHECK_EQ(scope.run_sizes.shape_stack, -1);
-    ICHECK_EQ(scope.run_sizes.array_stack, 0);
+    {
+      // NOTE: this scope reference is invalid after any mutation is applied to alloca_scope_.
+      auto& scope = alloca_scope_.back();
+      // This invariant asserts the assumption that
+      // make_stack_shape only happens within a call_packed.
+      // We could relax this in the future if we want to
+      // introduce root scope as a separate scope
+      ICHECK_EQ(alloca_scope_.size(), scope_size)
+          << "alloca_scope_ length is different before and after recursion";
+      ICHECK_EQ(scope.run_sizes.shape_stack, -1)
+          << "Expect no tvm_stack_make_shape outside of CallNodes";
+      ICHECK_EQ(scope.run_sizes.array_stack, 0)
+          << "Expect no tvm_stack_make_array outside of CallNodes";
+    }
 
     auto prep_seq = std::move(prep_seq_stack_.back());
     prep_seq_stack_.pop_back();
@@ -158,8 +206,8 @@ class BuiltinLower : public StmtExprMutator {
 
   Stmt VisitStmt_(const LetStmtNode* op) final {
     if (const CallNode* call = op->value.as<CallNode>()) {
-      if (call->op.same_as(builtin::texture2d_alloca())) {
-        return StmtExprMutator::VisitStmt(MakeTextureAlloc(op, call));
+      if (call->op.same_as(builtin::nd_mem_alloc_with_scope())) {
+        return StmtExprMutator::VisitStmt(MakeNdMemAllocWithScope(op, call));
       }
     }
     return StmtExprMutator::VisitStmt_(op);
@@ -336,9 +384,12 @@ class BuiltinLower : public StmtExprMutator {
                                        make_const(DataType::UInt(16), dtype.lanes())));
     // set byte offset
     int data_bytes = GetVectorBytes(dtype);
-    PrimExpr byte_offset = op->args[5];
-    if (!is_zero(byte_offset)) {
-      byte_offset = byte_offset * make_const(byte_offset.dtype(), data_bytes);
+    PrimExpr elem_offset = op->args[5];
+    PrimExpr byte_offset;
+    if (!is_zero(elem_offset)) {
+      byte_offset = elem_offset * make_const(elem_offset.dtype(), data_bytes);
+    } else {
+      byte_offset = elem_offset;
     }
     prep_seq.emplace_back(TVMStructSet(scope.stack_array, idx, builtin::kArrByteOffset,
                                        cast(DataType::UInt(64), byte_offset)));
@@ -403,8 +454,14 @@ class BuiltinLower : public StmtExprMutator {
 
     // cpacked call resource_handle
     if (!use_string_lookup) {
-      tir::Var resource_handle = Downcast<Var>(op->args[arg_count]);
-      packed_args.push_back(StringImm(resource_handle->name_hint));
+      PrimExpr last_arg = op->args[arg_count];
+      const VarNode* var_node = last_arg.as<VarNode>();
+      if (var_node != nullptr) {
+        tir::Var resource_handle = GetRef<Var>(var_node);
+        packed_args.push_back(StringImm(resource_handle->name_hint));
+      } else {
+        packed_args.push_back(last_arg);
+      }
     }
 
     auto builtin_call = use_string_lookup ? builtin::tvm_call_packed_lowered()
@@ -459,7 +516,7 @@ class BuiltinLower : public StmtExprMutator {
     return Call(op->dtype, builtin::tvm_call_trace_packed_lowered(), packed_args);
   }
 
-  Stmt MakeTextureAlloc(const LetStmtNode* let, const CallNode* call) {
+  Stmt MakeNdMemAllocWithScope(const LetStmtNode* let, const CallNode* call) {
     ICHECK(device_type_.defined()) << "Unknown device type in current IR";
     ICHECK(device_id_.defined()) << "Unknown device id in current IR";
     Stmt throw_last_error = Evaluate(Call(DataType::Int(32), builtin::tvm_throw_last_error(), {}));
@@ -467,24 +524,32 @@ class BuiltinLower : public StmtExprMutator {
     Stmt body = SeqStmt(
         {IfThenElse(Call(DataType::Bool(1), builtin::isnullptr(), {let->var}), throw_last_error),
          let->body});
+
     DataType dtype =
         let->var->type_annotation.as<PointerTypeNode>()->element_type.as<PrimTypeNode>()->dtype;
 
     std::string fdevapi_prefix = "device_api.";
     fdevapi_prefix += runtime::DeviceName(device_type_.as<IntImmNode>()->value);
-    Call call_packed =
-        Call(let->var.dtype(), builtin::tvm_call_packed(),
-             {StringImm(fdevapi_prefix + ".AllocTexture"), cast(DataType::Int(32), device_type_),
-              cast(DataType::Int(32), device_id_), cast(DataType::UInt(64), call->args[0]),
-              cast(DataType::UInt(64), call->args[1]), IntImm(DataType::Int(32), dtype.code()),
-              IntImm(DataType::Int(32), dtype.bits())});
 
+    Array<PrimExpr> args = {
+        StringImm(fdevapi_prefix + ".alloc_nd"),
+        device_type_,
+        device_id_,
+        IntImm(DataType::Int(32), dtype.code()),
+        IntImm(DataType::Int(32), dtype.bits()),
+    };
+
+    for (size_t i = 0; i < call->args.size(); ++i) {
+      args.push_back(call->args[i]);
+    }
+
+    Call call_packed = Call(let->var.dtype(), builtin::tvm_call_packed(), args);
     Stmt alloca = LetStmt(let->var, call_packed, body);
 
-    Call free_op =
-        Call(DataType::Int(32), builtin::tvm_call_packed(),
-             {StringImm(fdevapi_prefix + ".FreeTexture"), cast(DataType::Int(32), device_type_),
-              cast(DataType::Int(32), device_id_), let->var});
+    PrimExpr storage_scope = call->args[0];
+    Call free_op = Call(DataType::Int(32), builtin::tvm_call_packed(),
+                        {StringImm(fdevapi_prefix + ".free_nd"), device_type_, device_id_,
+                         storage_scope, let->var});
 
     Stmt free_stmt = IfThenElse(free_op != make_zero(DataType::Int(32)), throw_last_error);
     body = SeqStmt({alloca, free_stmt});
@@ -520,6 +585,7 @@ Pass LowerTVMBuiltin() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     auto* n = f.CopyOnWrite();
     n->body = BuiltinLower().Build(n->body);
+    VLOG(2) << "LowerTVMBuiltin: " << f;
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tir.LowerTVMBuiltin", {});

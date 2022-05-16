@@ -102,15 +102,21 @@ def test_split_indices_legalize():
         """
         return tvm.parser.fromtext(expected_ir_string)
 
+    rewrite_split = [legalize.PartitionedSplitRewriter(), legalize.SplitRewriter()]
+
     mod_axis1 = tvm.IRModule()
-    mod_axis1["tvmgen_default_ethos_u_main_0"] = create_graph(1)
-    mod_axis1 = legalize.LegalizeSplit()(mod_axis1)
+    func = create_graph(1)
+    for r in rewrite_split:
+        func = dataflow_pattern.rewrite(r, func)
+    mod_axis1["tvmgen_default_ethos_u_main_0"] = func
     expected_axis1 = expected_mod_axis1()
     tvm.ir.assert_structural_equal(mod_axis1, expected_axis1)
 
     mod_axis2 = tvm.IRModule()
-    mod_axis2["tvmgen_default_ethos_u_main_0"] = create_graph(2)
-    mod_axis2 = legalize.LegalizeSplit()(mod_axis2)
+    func = create_graph(2)
+    for r in rewrite_split:
+        func = dataflow_pattern.rewrite(r, func)
+    mod_axis2["tvmgen_default_ethos_u_main_0"] = func
     expected_axis2 = expected_mod_axis2()
     tvm.ir.assert_structural_equal(mod_axis2, expected_axis2)
 
@@ -198,31 +204,23 @@ def test_split_sections_legalize():
         """
         return tvm.parser.fromtext(expected_ir_string)
 
+    rewrite_split = [legalize.PartitionedSplitRewriter(), legalize.SplitRewriter()]
+
     mod_axis1 = tvm.IRModule()
-    mod_axis1["tvmgen_default_ethos_u_main_0"] = create_graph(1, 5)
-    mod_axis1 = legalize.LegalizeSplit()(mod_axis1)
+    func = create_graph(1, 5)
+    for r in rewrite_split:
+        func = dataflow_pattern.rewrite(r, func)
+    mod_axis1["tvmgen_default_ethos_u_main_0"] = func
     expected_axis1 = expected_mod_axis1()
     tvm.ir.assert_structural_equal(mod_axis1, expected_axis1)
 
     mod_axis2 = tvm.IRModule()
-    mod_axis2["tvmgen_default_ethos_u_main_0"] = create_graph(2, 5)
-    mod_axis2 = legalize.LegalizeSplit()(mod_axis2)
+    func = create_graph(2, 5)
+    for r in rewrite_split:
+        func = dataflow_pattern.rewrite(r, func)
+    mod_axis2["tvmgen_default_ethos_u_main_0"] = func
     expected_axis2 = expected_mod_axis2()
     tvm.ir.assert_structural_equal(mod_axis2, expected_axis2)
-
-
-def infer_type_function_pass(func):
-    mod = tvm.IRModule()
-    mod["test"] = func
-    mod = relay.transform.InferType()(mod)
-    return mod["test"]
-
-
-def get_shape_expr(in_expr, out_expr):
-    main_f = relay.Function([in_expr], out_expr)
-    main_f = infer_type_function_pass(main_f)
-    shape = [int(i) for i in main_f.body.checked_type.shape]
-    return shape
 
 
 INVERSE_LAYOUT_TRANSFORM_OHWI_MAP = {
@@ -575,6 +573,7 @@ def test_tflite_binary_elemwise_legalize(
     reversed_operands,
     activation_function,
 ):
+    np.random.seed(0)
     dtype = "int8"
 
     def create_tflite_graph():
@@ -638,6 +637,18 @@ def test_tflite_binary_elemwise_legalize(
         assert op.attrs.reversed_operands == reversed_operands
         if activation_function == "RELU":
             assert str(op.attrs.activation) == "CLIP"
+
+            if operator_type in ["MIN", "MAX"]:
+                # MIN and MAX with an activation must have a requantize operation
+                # baked into the output. To check the extra requantize node was
+                # picked up by the pattern, we can make sure the quantization
+                # information is not default.
+                assert float(op.attrs.ifm_scale) != 1.0
+                assert int(op.attrs.ifm_zero_point) != 0
+                assert float(op.attrs.ifm2_scale) != 1.0
+                assert int(op.attrs.ifm2_zero_point) != 0
+                assert float(op.attrs.ofm_scale) != 1.0
+                assert int(op.attrs.ofm_zero_point) != 0
 
         if has_reshaped_output:
             assert list(ext_func.body.checked_type.shape) == out_shape

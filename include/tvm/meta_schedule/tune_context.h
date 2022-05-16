@@ -54,6 +54,8 @@ class TuneContextNode : public runtime::Object {
   Map<Mutator, FloatImm> mutator_probs;
   /*! \brief The name of the tuning task. */
   Optional<String> task_name;
+  /*! \brief The tuning task's logging function. t*/
+  PackedFunc logging_func;
   /*! \brief The random state. */
   support::LinearCongruentialEngine::TRandState rand_state;
   /*! \brief The number of threads to be used. */
@@ -62,7 +64,7 @@ class TuneContextNode : public runtime::Object {
   /*! \brief The task scheduler that owns the tune context */
   const TaskSchedulerNode* task_scheduler;
   /*! \brief Whether the tuning task has been stopped or finished. */
-  bool is_stopped;
+  bool is_terminated;
   /*! \brief The measure candidates. */
   Optional<Array<MeasureCandidate>> measure_candidates;
   /*! \brief The building results. */
@@ -81,10 +83,11 @@ class TuneContextNode : public runtime::Object {
     v->Visit("task_name", &task_name);
     v->Visit("rand_state", &rand_state);
     v->Visit("num_threads", &num_threads);
-    v->Visit("is_stopped", &is_stopped);
+    v->Visit("is_terminated", &is_terminated);
     v->Visit("builder_results", &builder_results);
     v->Visit("runner_futures", &runner_futures);
     v->Visit("measure_candidates", &measure_candidates);
+    // `logging_func` is not visited
   }
 
   /*! \brief Initialize members that needs initialization with tune context. */
@@ -110,6 +113,7 @@ class TuneContext : public runtime::ObjectRef {
    * \param postprocs The postprocessors.
    * \param mutator_probs The probability of using certain mutator.
    * \param task_name The name of the tuning task.
+   * \param logging_func The tuning task's logging function.
    * \param rand_state The random state.
    * \param num_threads The number of threads to be used.
    */
@@ -121,6 +125,7 @@ class TuneContext : public runtime::ObjectRef {
                                Optional<Array<Postproc>> postprocs,                       //
                                Optional<Map<Mutator, FloatImm>> mutator_probs,            //
                                Optional<String> task_name,                                //
+                               PackedFunc logging_func,                                   //
                                support::LinearCongruentialEngine::TRandState rand_state,  //
                                int num_threads);
   TVM_DEFINE_MUTABLE_NOTNULLABLE_OBJECT_REF_METHODS(TuneContext, ObjectRef, TuneContextNode);

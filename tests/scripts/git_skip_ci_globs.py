@@ -25,10 +25,10 @@ from git_utils import git
 
 globs = [
     "*.md",
-    "docker/*",
     "conda/*",
     ".github/*",
     ".asf.yaml",
+    ".gitignore",
     "LICENSE",
     "NOTICE",
     "KEYS",
