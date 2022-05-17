@@ -553,7 +553,7 @@ IF(USE_MEMCOV) # CLANG-11+ please
   SET(CMAKE_CXX_FLAGS_RELEASE "-O1") # stop code inline.
   SET_SOURCE_FILES_PROPERTIES(
       ${COMPILER_SRCS} ${RUNTIME_SRCS}
-      PROPERTIES 
+      PROPERTIES
       COMPILE_FLAGS
       "-fsanitize-coverage=trace-pc-guard")
 ENDIF()
@@ -563,17 +563,6 @@ IF(USE_ASTCOV)
   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
   SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
 ENDIF()
-
-# ## Workaround with ASAN
-# SET_SOURCE_FILES_PROPERTIES(
-#   ${COMPILER_SRCS} ${RUNTIME_SRCS}
-#   PROPERTIES 
-#   COMPILE_FLAGS
-#   "-fsanitize=address -fsanitize-coverage=trace-pc-guard")
-# target_link_libraries(tvm PRIVATE /usr/lib/clang/14/lib/linux/libclang_rt.asan-x86_64.so)
-# target_link_libraries(tvm_runtime PRIVATE /usr/lib/clang/14/lib/linux/libclang_rt.asan-x86_64.so)
-# # # LD_PRELOAD=$(clang-14 -print-file-name=libclang_rt.asan-x86_64.so) ASAN_OPTIONS=coverage=1 ipython
-# remember to install libclang: `sudo apt install libclang-dev`
 
 if(USE_MICRO)
   # NOTE: cmake doesn't track dependencies at the file level across subdirectories. For the
